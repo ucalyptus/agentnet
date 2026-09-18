@@ -13,9 +13,19 @@ import {
 } from './protocol.js';
 
 const NAME_PATTERN = /^[a-z][a-z0-9-]{0,47}$/;
+// Admin commands accept a full fingerprint or a long unique prefix; the server resolves it.
+const REFERENCE_PATTERN = /^[a-f0-9]{16,64}$/;
+const INVITE_PATTERN = /^[A-Za-z0-9_-]{32,256}$/;
 const RESPONSE_LIMIT = 4 * 1024 * 1024;
+const REQUEST_TIMEOUT = 15_000;
+// The server holds a waiting inbox request for up to 25 seconds before answering.
+const WAIT_TIMEOUT = 35_000;
+// Floor between polls that returned nothing new, so a held inbox never becomes a busy loop.
+const IDLE_DELAY = 5_000;
+const CLOCK_WARNING = 10_000;
 const decoder = new TextDecoder('utf-8', { fatal: true });
 export const DEFAULT_HOME = join(homedir(), '.local', 'share', 'agentnet');
+export const DEFAULT_SERVER = 'https://net.ucalyptus.me';
 export class ClientError extends Error {}
 export function requireCondition(condition: unknown, message: string): asserts condition {
   if (!condition) throw new ClientError(message);
@@ -81,6 +91,23 @@ export async function readFileSafely(path: string, maximum: number, secret = tru
     return decoder.decode(bytes.subarray(0, count));
   } finally { await handle.close(); }
 }
+// Standard input keeps secrets out of argv and out of temporary files nobody deletes.
+async function readStandardInput(maximum: number): Promise<string> {
+  requireCondition(!process.stdin.isTTY, 'Standard input is a terminal. Pipe the content in or use the file option.');
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const chunk of process.stdin) {
+    const part = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string, 'utf8');
+    bytes += part.byteLength;
+    requireCondition(bytes <= maximum, 'Standard input exceeds the allowed size.');
+    chunks.push(part);
+  }
+  return decoder.decode(Buffer.concat(chunks, bytes));
+}
+export type TextSource = { file: string } | { stdin: true };
+async function readSource(source: TextSource, maximum: number, secret: boolean): Promise<string> {
+  return 'stdin' in source ? readStandardInput(maximum) : readFileSafely(resolve(source.file), maximum, secret);
+}
 async function syncDirectory(path: string): Promise<void> {
   const handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   try { await handle.sync(); } finally { await handle.close(); }
@@ -103,6 +130,17 @@ async function writeExclusive(path: string, text: string): Promise<void> {
   finally { await unlink(temporary); }
   await syncDirectory(dirname(path));
 }
+// A spool file is both the local copy and the durable cursor: an existing name means
+// the message was already delivered to this spool and must never be printed again.
+async function spoolMessage(directory: string, item: InboxItem & { untrusted: true }): Promise<boolean> {
+  try {
+    await writeExclusive(join(directory, `${messageID(item.message.id)}.json`), JSON.stringify({ ...item, transportOnly: true }) + '\n');
+    return true;
+  } catch (error) {
+    if (isCode(error, 'EEXIST')) return false;
+    throw error;
+  }
+}
 function name(value: unknown): string {
   requireCondition(typeof value === 'string' && NAME_PATTERN.test(value), 'Invalid agent name.');
   return value;
@@ -111,12 +149,25 @@ export function identityID(value: unknown): string {
   requireCondition(typeof value === 'string' && ID_PATTERN.test(value), 'Use the complete 64-character identity fingerprint.');
   return value;
 }
+export function identityReference(value: unknown): string {
+  requireCondition(typeof value === 'string' && REFERENCE_PATTERN.test(value), 'Use a complete 64-character identity fingerprint or a unique prefix of at least 16 hexadecimal characters.');
+  return value as string;
+}
+function resolvedID(value: unknown, reference: string): string {
+  const id = identityID(value);
+  requireCondition(id.startsWith(reference), 'Server answered about a different identity than the one requested.');
+  return id;
+}
 export function messageID(value: unknown): string {
   requireCondition(typeof value === 'string' && UUID_PATTERN.test(value), 'Use a complete message UUID.');
   return value;
 }
 function timestamp(value: unknown): number {
   requireCondition(Number.isSafeInteger(value) && (value as number) > 0, 'Invalid server timestamp.');
+  return value as number;
+}
+function counter(value: unknown): number {
+  requireCondition(Number.isSafeInteger(value) && (value as number) >= 0, 'Invalid server count.');
   return value as number;
 }
 function array(value: unknown, maximum: number): unknown[] {
@@ -130,8 +181,23 @@ async function peer(value: unknown): Promise<Peer> {
 interface Config { version: 1; server: string; role: 'agent' | 'admin' }
 export interface InboxReceipt { messages: (InboxItem & { untrusted: true })[]; transportOnly: true }
 export interface HistoryItem { message: Message; status: 'pending' | 'acknowledged' | 'blocked'; untrusted: true }
+export interface ReceiveOptions { wait: boolean; spool?: string; ack: boolean }
+export interface NetworkStatus {
+  agents: { id: string; name: string | null; status: string; pending: number; lastSeen: number | null }[];
+  totals: { active: number; pending: number; revoked: number; messages: number; pendingMessages: number };
+}
+export interface DoctorReport {
+  home: { path: string; mode: string; ok: boolean };
+  config: { server: string; role: 'agent' | 'admin' };
+  enrollment: { status: string | null; name: string | null };
+  peers: number | null;
+  server: { reachable: boolean; roundTripMs: number; serverTime: number | null; clockSkewMs: number | null; error: string | null };
+  warnings: string[];
+}
 
 export class AgentClient {
+  // Latest response Date header; the clock reference when a route returns no server time.
+  private serverDate: number | null = null;
   private constructor(readonly home: string, readonly config: Config, private readonly identity: PrivateIdentity) {}
 
   static async init(homeValue: string, origin: string, admin: boolean): Promise<AgentClient> {
@@ -174,18 +240,20 @@ export class AgentClient {
   requireRole(role: 'agent' | 'admin'): void {
     requireCondition(this.config.role === role, role === 'admin' ? 'This command requires a separate admin home initialized with --admin.' : 'An admin identity cannot participate as an agent. Use a separate agent home.');
   }
-  private async request(path: string, value: unknown = {}, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  private async request(path: string, value: unknown = {}, options: { signal?: AbortSignal; timeout?: number } = {}): Promise<Record<string, unknown>> {
     await privateDirectory(this.home);
     const raw = JSON.stringify(value);
     requireCondition(Buffer.byteLength(raw) <= MAX_REQUEST_BYTES, 'Request exceeds the allowed size.');
     const url = this.config.server + path;
     const authorization = await signRequest(this.identity, url, raw);
-    const abort = AbortSignal.any([AbortSignal.timeout(15_000), ...(signal ? [signal] : [])]);
+    const abort = AbortSignal.any([AbortSignal.timeout(options.timeout ?? REQUEST_TIMEOUT), ...(options.signal ? [options.signal] : [])]);
     try {
       const response = await fetch(url, {
         method: 'POST', redirect: 'error', signal: abort,
         headers: { 'Content-Type': 'application/json', Accept: 'application/json', Authorization: `Bearer ${authorization}` }, body: raw,
       });
+      const served = Date.parse(response.headers.get('date') ?? '');
+      this.serverDate = Number.isSafeInteger(served) ? served : null;
       if (!response.ok) {
         await response.body?.cancel();
         throw new ClientError(`Server rejected the request (HTTP ${response.status}).`);
@@ -211,23 +279,31 @@ export class AgentClient {
       return record(JSON.parse(decoder.decode(Buffer.concat(chunks, bytes))));
     } catch (error) {
       if (error instanceof ClientError) throw error;
-      if (signal?.aborted) throw new ClientError('Cancelled.');
+      if (options.signal?.aborted) throw new ClientError('Cancelled.');
       throw new ClientError('Request failed, timed out, redirected, or returned invalid data.');
     }
   }
-  async status(): Promise<{ id: string; status: string; name: string | null }> {
+  async status(): Promise<{ id: string; status: string; name: string | null; serverTime: number | null }> {
     this.requireRole('agent');
     const result = await this.request('/v1/status');
     requireCondition(result.id === this.identity.public.id && ['pending', 'active', 'revoked'].includes(String(result.status)), 'Invalid enrollment status.');
-    return { id: this.identity.public.id, status: result.status as string, name: result.name === null ? null : name(result.name) };
+    return {
+      id: this.identity.public.id,
+      status: result.status as string,
+      name: result.name === null || result.name === undefined ? null : name(result.name),
+      serverTime: result.serverTime === undefined ? null : timestamp(result.serverTime),
+    };
   }
-  async enroll(invitePath: string): Promise<{ id: string; status: 'pending' }> {
+  async enroll(source: TextSource): Promise<{ id: string; status: 'pending' | 'active'; name: string | null }> {
     this.requireRole('agent');
-    const invite = (await readFileSafely(resolve(invitePath), 1024)).trim();
-    requireCondition(/^[A-Za-z0-9_-]{32,256}$/.test(invite), 'Invitation file must contain a valid invitation token.');
+    const invite = (await readSource(source, 1024, true)).trim();
+    requireCondition(INVITE_PATTERN.test(invite), 'Provide a valid invitation token in a private file or on standard input.');
     const result = await this.request('/v1/enroll', { identity: this.identity.public, invite });
-    requireCondition(result.id === this.identity.public.id && result.status === 'pending', 'Invalid enrollment response.');
-    return { id: this.identity.public.id, status: 'pending' };
+    requireCondition(result.id === this.identity.public.id && (result.status === 'pending' || result.status === 'active'), 'Invalid enrollment response.');
+    const status = result.status as 'pending' | 'active';
+    // An auto-approving invitation reserves the name, so the server names the agent right away.
+    const label = status === 'active' ? name(result.name) : (result.name === null || result.name === undefined ? null : name(result.name));
+    return { id: this.identity.public.id, status, name: label };
   }
   async peers(): Promise<Peer[]> {
     this.requireRole('agent');
@@ -236,20 +312,21 @@ export class AgentClient {
     requireCondition(new Set(peers.map(item => item.identity.id)).size === peers.length && new Set(peers.map(item => item.name)).size === peers.length, 'Server returned duplicate peers or names.');
     return peers;
   }
-  async send(recipient: string, file: string, kind: MessageBody['kind']): Promise<{ id: string; duplicate: boolean; transportOnly: true }> {
+  async send(recipient: string, source: TextSource, kind: MessageBody['kind']): Promise<{ id: string; duplicate: boolean; transportOnly: true }> {
     this.requireRole('agent');
     const target = (await this.peers()).find(item => item.identity.id === recipient || item.name === recipient);
     requireCondition(target, 'Recipient is not currently granted. Use peers to list allowed recipients.');
     requireCondition(['message', 'prompt', 'instruction'].includes(kind), 'Invalid message kind.');
-    const text = await readFileSafely(resolve(file), MAX_TEXT_BYTES, false);
+    const text = await readSource(source, MAX_TEXT_BYTES, false);
     const message = createMessage(this.identity.public.id, target.identity.id, { kind, text });
     const result = await this.request('/v1/send', { message });
     requireCondition(result.id === message.id && typeof result.duplicate === 'boolean', 'Invalid send receipt.');
     return { id: message.id, duplicate: result.duplicate, transportOnly: true };
   }
-  async inbox(signal?: AbortSignal): Promise<InboxReceipt> {
+  async inbox(options: { wait?: boolean; signal?: AbortSignal } = {}): Promise<InboxReceipt> {
     this.requireRole('agent');
-    const result = await this.request('/v1/inbox', {}, signal);
+    const wait = options.wait === true;
+    const result = await this.request('/v1/inbox', wait ? { wait: true } : {}, { signal: options.signal, timeout: wait ? WAIT_TIMEOUT : REQUEST_TIMEOUT });
     const messages = await Promise.all(array(result.messages, 20).map(async value => {
       const item = record(value);
       const sender = await validatePublicIdentity(item.sender);
@@ -265,20 +342,88 @@ export class AgentClient {
     requireCondition(result.acknowledged === 0 || result.acknowledged === 1, 'Invalid acknowledgment receipt.');
     return { acknowledged: result.acknowledged, transportOnly: true };
   }
-  async receive(onReceipt: (value: InboxReceipt) => void, wait: boolean, signal: AbortSignal): Promise<void> {
+  // Acknowledgment always follows durable delivery: a synced spool file when spooling,
+  // otherwise a completed write to standard output. It reports receipt, never execution.
+  async receive(emit: (value: InboxReceipt) => Promise<void> | void, options: ReceiveOptions, signal: AbortSignal): Promise<void> {
+    this.requireRole('agent');
+    const spool = options.spool === undefined ? undefined : resolve(options.spool);
+    if (spool !== undefined) await privateDirectory(spool, true);
     const seen = new Set<string>();
     let first = true;
-    do {
+    while (!signal.aborted) {
+      const started = Date.now();
+      const receipt = await this.inbox({ wait: options.wait, signal });
       if (signal.aborted) return;
-      const receipt = await this.inbox(signal);
-      const messages = receipt.messages.filter(item => !seen.has(item.message.id));
-      for (const item of messages) seen.add(item.message.id);
-      if (first || messages.length) onReceipt({ messages, transportOnly: true });
+      const fresh: InboxReceipt['messages'] = [];
+      for (const item of receipt.messages) {
+        if (spool === undefined) {
+          if (seen.has(item.message.id)) continue;
+          seen.add(item.message.id);
+        } else if (!await spoolMessage(spool, item)) continue;
+        fresh.push(item);
+      }
+      if (first || fresh.length) await emit({ messages: fresh, transportOnly: true });
       first = false;
-      if (!wait || signal.aborted) return;
-      try { await delay(5000, undefined, { signal }); }
-      catch (error) { if (signal.aborted) return; throw error; }
-    } while (!signal.aborted);
+      if (options.ack) {
+        for (const item of fresh) {
+          if (signal.aborted) return;
+          await this.ack(item.message.id);
+        }
+      }
+      if (!options.wait || signal.aborted) return;
+      // Unacknowledged messages are returned again immediately; pace those rounds.
+      const idle = fresh.length === 0 ? IDLE_DELAY - (Date.now() - started) : 0;
+      if (idle > 0) {
+        try { await delay(idle, undefined, { signal }); }
+        catch (error) { if (signal.aborted) return; throw error; }
+      }
+    }
+  }
+  async doctor(): Promise<DoctorReport> {
+    const warnings: string[] = [];
+    let mode = '----';
+    let homeOk = true;
+    try {
+      await privateDirectory(this.home);
+      mode = ((await lstat(this.home)).mode & 0o7777).toString(8).padStart(4, '0');
+    } catch { homeOk = false; warnings.push('Home directory is missing, not yours, or not mode 0700.'); }
+    let enrollment: { status: string | null; name: string | null } = { status: null, name: null };
+    let serverTime: number | null = null;
+    let reachable = false;
+    let serverError: string | null = null;
+    const before = Date.now();
+    try {
+      if (this.config.role === 'agent') {
+        const result = await this.status();
+        enrollment = { status: result.status, name: result.name };
+        serverTime = result.serverTime;
+      } else {
+        await this.request('/v1/admin/status');
+      }
+      reachable = true;
+    } catch (error) { serverError = error instanceof ClientError ? error.message : 'Server request failed.'; }
+    const after = Date.now();
+    const observed = serverTime ?? (reachable ? this.serverDate : null);
+    const clockSkewMs = observed === null ? null : observed - Math.round((before + after) / 2);
+    let peers: number | null = null;
+    if (enrollment.status === 'active') {
+      try { peers = (await this.peers()).length; }
+      catch { warnings.push('Peer list could not be read even though this identity is active.'); }
+    }
+    if (!reachable) warnings.push(`Server ${this.config.server} could not be reached. Commands that talk to the network will fail.`);
+    if (clockSkewMs !== null && Math.abs(clockSkewMs) > CLOCK_WARNING) {
+      warnings.push(`This machine's clock differs from the server by about ${Math.round(clockSkewMs / 1000)} seconds. Signed requests carry a 60 second validity window, so every command fails once the difference passes that tolerance. Synchronize the system clock.`);
+    }
+    if (enrollment.status === 'pending') warnings.push('This identity is still pending. An admin must approve it before sending or receiving.');
+    if (enrollment.status === 'revoked') warnings.push('This identity is revoked permanently. Initialize a new home to rejoin.');
+    return {
+      home: { path: this.home, mode, ok: homeOk },
+      config: { server: this.config.server, role: this.config.role },
+      enrollment,
+      peers,
+      server: { reachable, roundTripMs: after - before, serverTime, clockSkewMs, error: serverError },
+      warnings,
+    };
   }
   async archive(): Promise<{ archive: string; networkRevoked: false }> {
     requireCondition(process.stdin.isTTY && process.stdout.isTTY && process.stderr.isTTY, 'Remove requires an interactive terminal. There is no noninteractive approval option.');
@@ -298,16 +443,25 @@ export class AgentClient {
     await syncDirectory(dirname(this.home));
     return { archive, networkRevoked: false };
   }
-  async adminInvite(outValue: string): Promise<{ path: string; expiresAt: number }> {
+  async adminInvite(outValue: string, options: { name?: string; autoApprove?: boolean } = {}): Promise<{ path: string; expiresAt: number; autoApprove: boolean; name: string | null }> {
     this.requireRole('admin');
+    const label = options.name === undefined ? null : name(options.name);
+    const autoApprove = options.autoApprove === true;
+    requireCondition(!autoApprove || label !== null, 'An auto-approving invitation must reserve a name with --name.');
     const path = resolve(outValue);
     await checkParents(path);
     requireCondition(!(await inspect(path)), 'Invitation output already exists. It was not overwritten.');
-    const result = await this.request('/v1/admin/invite');
-    requireCondition(typeof result.invite === 'string' && /^[A-Za-z0-9_-]{32,256}$/.test(result.invite), 'Invalid invitation response.');
+    const body: Record<string, unknown> = {};
+    if (label !== null) body.name = label;
+    if (autoApprove) body.autoApprove = true;
+    const result = await this.request('/v1/admin/invite', body);
+    requireCondition(typeof result.invite === 'string' && INVITE_PATTERN.test(result.invite), 'Invalid invitation response.');
     const expiresAt = timestamp(result.expiresAt);
+    const reserved = result.name === null || result.name === undefined ? null : name(result.name);
+    const automatic = result.autoApprove === true;
+    requireCondition(reserved === label && automatic === autoApprove, 'Server created a different invitation than the one requested.');
     await writeExclusive(path, result.invite + '\n');
-    return { path, expiresAt };
+    return { path, expiresAt, autoApprove: automatic, name: reserved };
   }
   async adminList(command: 'pending' | 'agents' | 'audit'): Promise<unknown> {
     this.requireRole('admin');
@@ -330,9 +484,32 @@ export class AgentClient {
     }));
     return { agents };
   }
+  async adminStatus(): Promise<NetworkStatus> {
+    this.requireRole('admin');
+    const result = await this.request('/v1/admin/status');
+    const agents = array(result.agents, 1000).map(value => {
+      const item = record(value);
+      requireCondition(['pending', 'active', 'revoked'].includes(String(item.status)), 'Invalid agent status.');
+      return {
+        id: identityID(item.id),
+        name: item.name === null ? null : name(item.name),
+        status: item.status as string,
+        pending: counter(item.pending),
+        lastSeen: item.lastSeen === null ? null : timestamp(item.lastSeen),
+      };
+    });
+    const totals = record(result.totals);
+    return {
+      agents,
+      totals: {
+        active: counter(totals.active), pending: counter(totals.pending), revoked: counter(totals.revoked),
+        messages: counter(totals.messages), pendingMessages: counter(totals.pendingMessages),
+      },
+    };
+  }
   async adminMessages(agent?: string): Promise<{ messages: HistoryItem[] }> {
     this.requireRole('admin');
-    const result = await this.request('/v1/admin/messages', agent === undefined ? {} : { agent: identityID(agent) });
+    const result = await this.request('/v1/admin/messages', agent === undefined ? {} : { agent: identityReference(agent) });
     const messages = array(result.messages, 100).map(value => {
       const item = record(value);
       const raw = record(item.message);
@@ -343,34 +520,65 @@ export class AgentClient {
     });
     return { messages };
   }
-  async adminApprove(idValue: string, nameValue: string): Promise<{ id: string; status: 'active'; name: string }> {
+  // Names are convenient locally; only identity fingerprints or prefixes reach the server.
+  private async resolveIdentities(values: string[]): Promise<string[]> {
+    const named = values.filter(value => !REFERENCE_PATTERN.test(value));
+    const byName = new Map<string, string>();
+    if (named.length) {
+      const listed = await this.adminList('agents') as { agents: { identity: { id: string }; status: string; name: string | null }[] };
+      for (const agent of listed.agents) {
+        if (agent.status === 'active' && agent.name !== null) byName.set(agent.name, agent.identity.id);
+      }
+    }
+    const resolved = values.map(value => {
+      if (REFERENCE_PATTERN.test(value)) return value;
+      const id = byName.get(name(value));
+      requireCondition(id, `No active agent is named ${value}.`);
+      return id as string;
+    });
+    requireCondition(new Set(resolved).size === resolved.length, 'The same identity was listed more than once.');
+    return resolved;
+  }
+  async adminApprove(idValue: string, nameValue: string, grantWith: string[] = []): Promise<{ id: string; status: 'active'; name: string; mutualGrants: number }> {
     this.requireRole('admin');
-    const id = identityID(idValue);
+    const reference = identityReference(idValue);
     const label = name(nameValue);
-    const result = await this.request('/v1/admin/approve', { id, name: label });
-    requireCondition(result.id === id && result.status === 'active' && result.name === label, 'Invalid approval receipt.');
-    return { id, status: 'active', name: label };
+    requireCondition(grantWith.length <= 16, 'At most 16 identities may be granted with an approval.');
+    const partners = grantWith.length ? await this.resolveIdentities(grantWith) : [];
+    const body: Record<string, unknown> = { id: reference, name: label };
+    if (partners.length) body.grantWith = partners;
+    const result = await this.request('/v1/admin/approve', body);
+    const id = resolvedID(result.id, reference);
+    requireCondition(result.status === 'active' && result.name === label, 'Invalid approval receipt.');
+    return { id, status: 'active', name: label, mutualGrants: result.mutualGrants === undefined ? 0 : counter(result.mutualGrants) };
+  }
+  async adminMesh(values: string[]): Promise<{ ids: string[]; edges: number }> {
+    this.requireRole('admin');
+    requireCondition(values.length >= 2 && values.length <= 16, 'Mesh requires between 2 and 16 identities.');
+    const ids = await this.resolveIdentities(values);
+    const result = await this.request('/v1/admin/mesh', { ids });
+    return { ids, edges: counter(result.edges) };
   }
   async adminRename(idValue: string, nameValue: string): Promise<{ id: string; name: string }> {
     this.requireRole('admin');
-    const id = identityID(idValue);
+    const reference = identityReference(idValue);
     const label = name(nameValue);
-    const result = await this.request('/v1/admin/rename', { id, name: label });
-    requireCondition(result.id === id && result.name === label, 'Invalid rename receipt.');
-    return { id, name: label };
+    const result = await this.request('/v1/admin/rename', { id: reference, name: label });
+    requireCondition(result.name === label, 'Invalid rename receipt.');
+    return { id: resolvedID(result.id, reference), name: label };
   }
   async adminRevoke(idValue: string): Promise<{ id: string; status: 'revoked' }> {
     this.requireRole('admin');
-    const id = identityID(idValue);
-    const result = await this.request('/v1/admin/revoke', { id });
-    requireCondition(result.id === id && result.status === 'revoked', 'Invalid revocation receipt.');
-    return { id, status: 'revoked' };
+    const reference = identityReference(idValue);
+    const result = await this.request('/v1/admin/revoke', { id: reference });
+    requireCondition(result.status === 'revoked', 'Invalid revocation receipt.');
+    return { id: resolvedID(result.id, reference), status: 'revoked' };
   }
   async adminGrant(fromValue: string, toValue: string, allow: boolean): Promise<{ from: string; to: string; allow: boolean }> {
     this.requireRole('admin');
-    const from = identityID(fromValue), to = identityID(toValue);
+    const from = identityReference(fromValue), to = identityReference(toValue);
     const result = await this.request('/v1/admin/grant', { from, to, allow });
-    requireCondition(result.from === from && result.to === to && result.allow === allow, 'Invalid grant receipt.');
-    return { from, to, allow };
+    requireCondition(result.allow === allow, 'Invalid grant receipt.');
+    return { from: resolvedID(result.from, from), to: resolvedID(result.to, to), allow };
   }
 }

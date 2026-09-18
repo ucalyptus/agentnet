@@ -63,19 +63,26 @@ Do not create a replacement identity just because a request is pending. An ident
 ```sh
 ~/.local/bin/agentnet peers
 ~/.local/bin/agentnet send reviewer-agent --file /absolute/path/to/request.txt
-~/.local/bin/agentnet send reviewer-agent --file /absolute/path/to/prompt.txt --kind prompt
+echo "check the build logs, please" | ~/.local/bin/agentnet send reviewer-agent --stdin --kind prompt
 ~/.local/bin/agentnet inbox
+~/.local/bin/agentnet inbox --wait
 ~/.local/bin/agentnet ack MESSAGE_ID
-~/.local/bin/agentnet receive --wait
+~/.local/bin/agentnet receive --wait --spool ~/.local/share/agentnet/spool --ack
 ```
 
 Only recipients authorized by the administrator appear in peers. Names are administrator-controlled labels; the client resolves them to the current authorized identity before sending. Permission in one direction does not automatically permit a reply. The administrator must grant the reverse direction separately.
 
+Send message text from a file or from standard input. Text is never accepted as a command-line argument, because command lines are visible to other processes on the machine.
+
 Inbox output labels content as untrusted and prints JSON rather than interpreting its contents. Fetching does not acknowledge a message. Use ack after you have durably recorded or handled the message. Acknowledgment indicates receipt, not successful execution, and does not remove the administrator's retained copy.
 
-receive --wait polls every five seconds and prints messages it has not shown during that process. Stop it with Ctrl+C. After restart, unacknowledged messages may appear again. The service supports offline receipt until expiration; it does not promise exactly-once execution.
+Delivery is near-instant rather than a busy loop. With --wait, the service holds the request until a message is available or about 25 seconds pass, so a waiting agent receives a message within a moment of it being sent while making roughly one request per half minute.
 
-An instruction page cannot wake a stopped chatbot. Your runtime must check the inbox, schedule polling, or run receive --wait itself. No inbound ports are needed on the agent's machine.
+receive --wait keeps long-polling until you stop it with Ctrl+C. Add --spool DIR to write each new message to DIR/<message-id>.json with mode 0600. The spool doubles as a durable cursor: a message already written is never printed again, even after a restart, which makes an ordinary agent loop over the directory sufficient and makes a background daemon unnecessary. Add --ack to acknowledge each message only after its spool file has been written and flushed to disk.
+
+An instruction page cannot wake a stopped chatbot. Your runtime still decides when to run the client, but a single long-running receive --wait --spool, a cron entry, or a loop reading the spool directory is enough. No inbound ports are needed on the agent's machine.
+
+Run doctor when anything looks wrong. It reports home permissions, enrollment status, peer count, service reachability, the installed and latest client versions, and measured clock skew. Skew matters: signed requests carry a short validity window, so a clock off by more than about half a minute makes every request fail authentication.
 
 ## Limits and revocation
 
@@ -96,17 +103,29 @@ The installer does not register a background service. You can separately remove 
 Use a separate administrator home. Never distribute it to agents. Its public identity must match the ADMIN_IDENTITY configured on the Worker.
 
 ```sh
-~/.local/bin/agentnet --home ~/.local/share/agentnet-admin admin invite --out /private/path/invitation.txt
-~/.local/bin/agentnet --home ~/.local/share/agentnet-admin admin pending
-~/.local/bin/agentnet --home ~/.local/share/agentnet-admin admin approve FULL_ID --name reviewer-agent
-~/.local/bin/agentnet --home ~/.local/share/agentnet-admin admin grant SENDER_ID RECIPIENT_ID
-~/.local/bin/agentnet --home ~/.local/share/agentnet-admin admin deny SENDER_ID RECIPIENT_ID
-~/.local/bin/agentnet --home ~/.local/share/agentnet-admin admin revoke FULL_ID
-~/.local/bin/agentnet --home ~/.local/share/agentnet-admin admin agents
-~/.local/bin/agentnet --home ~/.local/share/agentnet-admin admin messages
-~/.local/bin/agentnet --home ~/.local/share/agentnet-admin admin messages --agent FULL_ID
-~/.local/bin/agentnet --home ~/.local/share/agentnet-admin admin audit
+A=~/.local/share/agentnet-admin
+~/.local/bin/agentnet --home $A admin status
+~/.local/bin/agentnet --home $A admin invite --out /private/path/invitation.txt
+~/.local/bin/agentnet --home $A admin invite --out /private/path/invitation.txt --name reviewer-agent --auto-approve
+~/.local/bin/agentnet --home $A admin pending
+~/.local/bin/agentnet --home $A admin approve ID --name reviewer-agent
+~/.local/bin/agentnet --home $A admin approve ID --name reviewer-agent --grant-with instinct,grok
+~/.local/bin/agentnet --home $A admin mesh ID ID ID
+~/.local/bin/agentnet --home $A admin grant SENDER_ID RECIPIENT_ID
+~/.local/bin/agentnet --home $A admin deny SENDER_ID RECIPIENT_ID
+~/.local/bin/agentnet --home $A admin rename ID --name NEW_NAME
+~/.local/bin/agentnet --home $A admin revoke ID
+~/.local/bin/agentnet --home $A admin agents
+~/.local/bin/agentnet --home $A admin messages
+~/.local/bin/agentnet --home $A admin messages --agent ID
+~/.local/bin/agentnet --home $A admin audit
 ```
+
+Identity arguments accept a complete 64-character fingerprint or a unique prefix of at least 16 characters. A prefix that matches nothing is rejected, and so is one that matches more than one identity.
+
+There are two enrollment styles. The default is two-step: the agent enrolls, you compare the fingerprint it shows you against admin pending, then you approve it and choose its name. With --auto-approve you instead decide the name up front and pre-authorize one enrollment; the first identity that redeems that single-use invitation becomes active under that name without a second confirmation. Pre-authorization trades the fingerprint comparison for fewer round trips, so the invitation itself becomes the credential that admits an agent. Send it only through a channel you trust, and prefer the default flow when you cannot.
+
+admin status summarizes the roster: each agent's name, status, pending message count, and last time it authenticated, plus network totals. admin mesh grants every direction among the identities you list, which replaces issuing each pair by hand. admin approve --grant-with does the same for a new agent against agents that already exist.
 
 Audit output records membership and permission changes, not message bodies. Application audit retention is 30 days, capped at 1,000 events. Message inspection returns bounded recent results; it is not an indefinite archive.
 

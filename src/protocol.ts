@@ -77,14 +77,19 @@ export async function signRequest(identity: PrivateIdentity, url: string, body: 
 export async function verifyRequest(token: string, identity: PublicIdentity, url: string, body: string): Promise<{ nonce: string; expiresAt: number }> {
   const target = new URL(url);
   assert(!target.search && !target.hash, 'Query strings are not supported');
+  // clockTolerance absorbs modest agent clock skew, which otherwise surfaces as an
+  // unexplainable 401. Replay is prevented by the server's nonce registry, not by
+  // the validity window, so a small tolerance costs nothing.
   const { payload } = await jwtVerify(token, await importJWK(identity.signingKey, 'EdDSA'), {
     algorithms: ['EdDSA'], typ: 'agentnet-request+jwt', issuer: identity.id,
-    audience: target.origin, requiredClaims: ['iat', 'exp', 'jti'], maxTokenAge: '60s', clockTolerance: 0,
+    audience: target.origin, requiredClaims: ['iat', 'exp', 'jti'], maxTokenAge: '90s', clockTolerance: '30s',
   });
   assert(payload.method === 'POST' && payload.path === target.pathname && payload.hash === await sha256(body), 'Request signature does not match request');
   assert(typeof payload.iat === 'number' && typeof payload.exp === 'number' && payload.exp <= payload.iat + 60, 'Invalid request validity');
   assert(typeof payload.jti === 'string' && UUID_PATTERN.test(payload.jti), 'Invalid request nonce');
-  return { nonce: payload.jti, expiresAt: payload.exp * 1000 };
+  // Include the tolerance in the effective expiry so the replay nonce always outlives
+  // the window in which this token is still acceptable.
+  return { nonce: payload.jti, expiresAt: (payload.exp + 30) * 1000 };
 }
 export function validateMessageBody(value: unknown): MessageBody {
   const body = record(value);

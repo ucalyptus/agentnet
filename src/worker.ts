@@ -16,12 +16,14 @@ const MINUTE = 60_000;
 const PENDING_TTL = 24 * 60 * MINUTE;
 const INVITE_TTL = 60 * MINUTE;
 const AUDIT_TTL = 30 * 24 * 60 * MINUTE;
+const INBOX_WAIT = 25_000;
+const MAX_INBOX_WAITERS = 4;
 const API_PATHS: Record<string, true> = {
   '/v1/enroll': true, '/v1/status': true, '/v1/peers': true,
   '/v1/send': true, '/v1/inbox': true, '/v1/ack': true,
   '/v1/admin/invite': true, '/v1/admin/pending': true, '/v1/admin/approve': true, '/v1/admin/rename': true,
   '/v1/admin/revoke': true, '/v1/admin/grant': true, '/v1/admin/agents': true,
-  '/v1/admin/audit': true, '/v1/admin/messages': true,
+  '/v1/admin/audit': true, '/v1/admin/messages': true, '/v1/admin/mesh': true, '/v1/admin/status': true,
 };
 const ASSET_PATHS: Record<string, true> = {
   '/about.md': true, '/about.txt': true, '/agentnet.mjs': true,
@@ -29,6 +31,7 @@ const ASSET_PATHS: Record<string, true> = {
 };
 const NAME_PATTERN = /^[a-z][a-z0-9-]{0,47}$/;
 const INVITE_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const ID_PREFIX_PATTERN = /^[a-f0-9]{16,64}$/;
 const RESPONSE_HEADERS = { 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' };
 const encoder = new TextEncoder();
 
@@ -39,7 +42,12 @@ type AgentRow = {
   status: 'pending' | 'active' | 'revoked';
   created_at: number;
   expires_at: number | null;
+  last_seen: number | null;
 };
+type InvitationRow = { hash: string; expires_at: number; name: string | null; auto_approve: number | null };
+type InboxRow = { message: string; identity: string; name: string };
+// Returned by a long-polling inbox read that found nothing, so the caller can wait unlocked.
+type InboxHold = { hold: string };
 type Authenticated = {
   identity: PublicIdentity;
   admin: boolean;
@@ -90,6 +98,18 @@ function objectBody(raw: string): Record<string, unknown> {
 
 function fields(body: Record<string, unknown>, expected: string[]): void {
   requireValue(Object.keys(body).sort().join(',') === expected.sort().join(','));
+}
+
+function optionalFields(body: Record<string, unknown>, allowed: string[]): void {
+  requireValue(Object.keys(body).every(key => allowed.includes(key)));
+}
+
+function inboxPage(rows: InboxRow[]): Response {
+  return messagePage(rows, row => ({
+    message: JSON.parse(row.message) as Message,
+    sender: JSON.parse(row.identity) as PublicIdentity,
+    senderName: row.name,
+  }), 1024 * 1024);
 }
 
 function identityId(value: unknown): string {
@@ -170,6 +190,8 @@ export default {
 export class Network extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   private adminIdentity: PublicIdentity | undefined;
+  // Long poll waiters, in memory only: eviction or a crash just ends a poll early.
+  private readonly waiters = new Map<string, Set<() => void>>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -229,9 +251,52 @@ export class Network extends DurableObject<Env> {
         );
         CREATE INDEX IF NOT EXISTS audit_time ON audit(time);
       `);
+      this.migrate();
       this.ctx.storage.transactionSync(() => this.cleanup(Date.now()));
       await this.ctx.storage.setAlarm(Date.now() + MINUTE);
     });
+  }
+
+  // Columns are only ever added, and only when absent: stored identities survive a deploy.
+  private migrate(): void {
+    const additions: [string, string, string][] = [
+      ['agents', 'last_seen', 'INTEGER'],
+      ['invitations', 'name', 'TEXT'],
+      ['invitations', 'auto_approve', 'INTEGER'],
+    ];
+    for (const [table, column, type] of additions) {
+      const present = this.sql.exec<{ name: string }>(`PRAGMA table_info(${table})`).toArray().some(row => row.name === column);
+      if (!present) this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    }
+  }
+
+  // Called after a message row commits, never while a transaction or lock is held.
+  private wake(recipient: string): void {
+    const waiting = this.waiters.get(recipient);
+    if (!waiting) return;
+    this.waiters.delete(recipient);
+    for (const resolve of waiting) resolve();
+  }
+
+  private async hold(recipient: string): Promise<void> {
+    const waiting = this.waiters.get(recipient) ?? new Set<() => void>();
+    requireValue(waiting.size < MAX_INBOX_WAITERS, 429);
+    this.waiters.set(recipient, waiting);
+    let resolve!: () => void;
+    const delivered = new Promise<void>(settle => { resolve = () => settle(); });
+    waiting.add(resolve);
+    // One resolver ends the wait, whether a message arrived or the deadline expired.
+    const timer = setTimeout(resolve, INBOX_WAIT);
+    try {
+      await delivered;
+    } finally {
+      clearTimeout(timer);
+      const current = this.waiters.get(recipient);
+      if (current) {
+        current.delete(resolve);
+        if (current.size === 0) this.waiters.delete(recipient);
+      }
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -243,7 +308,7 @@ export class Network extends DurableObject<Env> {
       const token = bearer(request);
       // Do not hold the object-wide authentication lock while reading a client stream.
       const raw = await boundedBody(request);
-      return await this.ctx.blockConcurrencyWhile(async () => {
+      const result = await this.ctx.blockConcurrencyWhile(async () => {
         try {
           this.ctx.storage.transactionSync(() => this.cleanup(Date.now()));
           const auth = await this.authenticate(token, request.url, raw, url.pathname);
@@ -252,6 +317,14 @@ export class Network extends DurableObject<Env> {
           return await this.dispatch(url.pathname, body, auth);
         } catch (error) { return failure(error); }
       });
+      if (result instanceof Response) return result;
+      // The wait happens after the lock is released and outside every transaction, so
+      // other agents keep sending, acknowledging and being administered during a hold.
+      // The nonce was already consumed above: waiting never re-authenticates.
+      try {
+        await this.hold(result.hold);
+        return this.inbox(result.hold);
+      } catch (error) { return failure(error); }
     } catch (error) { return failure(error); }
   }
 
@@ -366,6 +439,7 @@ export class Network extends DurableObject<Env> {
       requireValue(proof.expiresAt > now, 401);
       requireValue(this.sql.exec('SELECT 1 FROM nonces WHERE identity_id = ? AND nonce = ?', identity.id, proof.nonce).toArray().length === 0, 401);
       this.sql.exec('INSERT INTO nonces (identity_id, nonce, expires_at) VALUES (?, ?, ?)', identity.id, proof.nonce, proof.expiresAt);
+      this.sql.exec('UPDATE agents SET last_seen = ? WHERE id = ?', now, identity.id);
     });
 
     if (isAdmin) {
@@ -378,7 +452,7 @@ export class Network extends DurableObject<Env> {
     return { identity, admin: isAdmin, nonce: proof.nonce, invitationHash };
   }
 
-  private async dispatch(path: string, body: Record<string, unknown>, auth: Authenticated): Promise<Response> {
+  private async dispatch(path: string, body: Record<string, unknown>, auth: Authenticated): Promise<Response | InboxHold> {
     switch (path) {
       case '/v1/enroll': return this.enroll(body, auth);
       case '/v1/send': return this.send(body, auth);
@@ -395,7 +469,7 @@ export class Network extends DurableObject<Env> {
             fields(body, []);
             const agent = this.agent(auth.identity.id);
             requireValue(agent, 403);
-            return json({ id: agent.id, status: agent.status, name: agent.name });
+            return json({ id: agent.id, status: agent.status, name: agent.name, serverTime: now });
           }
           this.active(auth.identity.id);
           switch (path) {
@@ -408,19 +482,11 @@ export class Network extends DurableObject<Env> {
               return json({ peers });
             }
             case '/v1/inbox': {
-              fields(body, []);
-              const rows = this.sql.exec<{ message: string; identity: string; name: string }>(`
-                SELECT m.message, a.identity, a.name FROM messages m
-                JOIN agents a ON a.id = m.sender AND a.status = 'active'
-                JOIN grants g ON g.from_id = m.sender AND g.to_id = m.recipient
-                WHERE m.recipient = ? AND m.status = 'pending' AND m.expires_at > ?
-                ORDER BY m.created_at, m.id LIMIT 20
-              `, auth.identity.id, now);
-              return messagePage(rows, row => ({
-                message: JSON.parse(row.message) as Message,
-                sender: JSON.parse(row.identity) as PublicIdentity,
-                senderName: row.name,
-              }), 1024 * 1024);
+              optionalFields(body, ['wait']);
+              requireValue(body.wait === undefined || typeof body.wait === 'boolean');
+              const rows = this.inboxRows(auth.identity.id, now);
+              if (rows.length === 0 && body.wait === true) return { hold: auth.identity.id };
+              return inboxPage(rows);
             }
             case '/v1/ack': {
               fields(body, ['ids']);
@@ -438,6 +504,26 @@ export class Network extends DurableObject<Env> {
     }
   }
 
+  private inboxRows(id: string, now: number): InboxRow[] {
+    return this.sql.exec<InboxRow>(`
+      SELECT m.message, a.identity, a.name FROM messages m
+      JOIN agents a ON a.id = m.sender AND a.status = 'active'
+      JOIN grants g ON g.from_id = m.sender AND g.to_id = m.recipient
+      WHERE m.recipient = ? AND m.status = 'pending' AND m.expires_at > ?
+      ORDER BY m.created_at, m.id LIMIT 20
+    `, id, now).toArray();
+  }
+
+  // Second read of a long poll: revocation and grant changes during the wait still apply.
+  private inbox(id: string): Response {
+    return this.ctx.storage.transactionSync(() => {
+      const now = Date.now();
+      this.cleanup(now);
+      this.active(id);
+      return inboxPage(this.inboxRows(id, now));
+    });
+  }
+
   private enroll(body: Record<string, unknown>, auth: Authenticated): Response {
     fields(body, ['identity', 'invite']);
     requireValue(typeof body.invite === 'string' && INVITE_PATTERN.test(body.invite));
@@ -448,19 +534,46 @@ export class Network extends DurableObject<Env> {
       requireValue(!this.agent(auth.identity.id), 409);
       const hash = auth.invitationHash;
       requireValue(typeof hash === 'string', 403);
-      requireValue(this.sql.exec('SELECT 1 FROM invitations WHERE hash = ? AND expires_at > ?', hash, now).toArray().length === 1, 403);
+      const invitation = this.sql.exec<InvitationRow>('SELECT hash, expires_at, name, auto_approve FROM invitations WHERE hash = ? AND expires_at > ?', hash, now).toArray()[0];
+      requireValue(invitation, 403);
       requireValue(this.count('SELECT COUNT(*) AS count FROM agents') < 1000, 429);
-      requireValue(this.count("SELECT COUNT(*) AS count FROM agents WHERE status = 'pending'") < 100, 429);
+      const reserved = invitation.auto_approve === 1 && typeof invitation.name === 'string' && NAME_PATTERN.test(invitation.name) ? invitation.name : null;
+      if (reserved === null) {
+        requireValue(this.count("SELECT COUNT(*) AS count FROM agents WHERE status = 'pending'") < 100, 429);
+      } else {
+        // The reserved name was taken after the invitation was issued: refuse, and roll
+        // back before the invitation is consumed so the administrator can reissue a name.
+        requireValue(this.sql.exec('SELECT 1 FROM agents WHERE name = ?', reserved).toArray().length === 0, 409);
+      }
       this.sql.exec('DELETE FROM invitations WHERE hash = ?', hash);
-      this.sql.exec("INSERT INTO agents (id, identity, name, status, created_at, expires_at) VALUES (?, ?, NULL, 'pending', ?, ?)", auth.identity.id, JSON.stringify(auth.identity), now, now + PENDING_TTL);
+      this.sql.exec(
+        'INSERT INTO agents (id, identity, name, status, created_at, expires_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        auth.identity.id, JSON.stringify(auth.identity), reserved, reserved === null ? 'pending' : 'active',
+        now, reserved === null ? now + PENDING_TTL : null, now,
+      );
       this.audit('enroll', auth.identity.id, now);
-      return json({ id: auth.identity.id, status: 'pending' });
+      if (reserved === null) return json({ id: auth.identity.id, status: 'pending' });
+      // Deny by default is unchanged: an auto-approved agent starts with no grants.
+      this.audit('approve', auth.identity.id, now);
+      return json({ id: auth.identity.id, status: 'active', name: reserved });
     });
   }
 
   private async invite(body: Record<string, unknown>, auth: Authenticated): Promise<Response> {
-    fields(body, []);
+    optionalFields(body, ['name', 'autoApprove']);
     requireValue(auth.admin, 403);
+    let name: string | null = null;
+    if (body.name !== undefined) {
+      requireValue(typeof body.name === 'string' && NAME_PATTERN.test(body.name));
+      name = body.name;
+    }
+    let autoApprove = false;
+    if (body.autoApprove !== undefined) {
+      requireValue(typeof body.autoApprove === 'boolean');
+      autoApprove = body.autoApprove;
+    }
+    // An invitation that approves itself must carry the name it will claim.
+    requireValue(!autoApprove || name !== null);
     this.rate(`invite:${auth.identity.id}`, auth.nonce, 10);
     const invite = base64url.encode(crypto.getRandomValues(new Uint8Array(32)));
     const hash = await sha256(invite);
@@ -471,10 +584,15 @@ export class Network extends DurableObject<Env> {
       const pending = this.count("SELECT COUNT(*) AS count FROM agents WHERE status = 'pending'");
       requireValue(invitations + pending < 100, 429);
       requireValue(this.count('SELECT COUNT(*) AS count FROM agents') + invitations < 1000, 429);
+      if (name !== null) {
+        requireValue(this.sql.exec('SELECT 1 FROM agents WHERE name = ?', name).toArray().length === 0, 409);
+        requireValue(this.sql.exec('SELECT 1 FROM invitations WHERE name = ? AND expires_at > ?', name, now).toArray().length === 0, 409);
+      }
       const expiresAt = now + INVITE_TTL;
-      this.sql.exec('INSERT INTO invitations (hash, expires_at) VALUES (?, ?)', hash, expiresAt);
+      // Only the invitation digest is stored; the token itself never reaches storage.
+      this.sql.exec('INSERT INTO invitations (hash, expires_at, name, auto_approve) VALUES (?, ?, ?, ?)', hash, expiresAt, name, autoApprove ? 1 : 0);
       this.audit('invite', auth.identity.id, now);
-      return json({ invite, expiresAt });
+      return json({ invite, expiresAt, autoApprove, name });
     });
   }
 
@@ -482,7 +600,8 @@ export class Network extends DurableObject<Env> {
     fields(body, ['message']);
     this.active(auth.identity.id);
     this.rate(`send:${auth.identity.id}`, auth.nonce, 60);
-    return this.ctx.storage.transactionSync(() => {
+    let stored: string | undefined;
+    const response = this.ctx.storage.transactionSync(() => {
       const now = Date.now();
       this.cleanup(now);
       let message: Message;
@@ -503,8 +622,36 @@ export class Network extends DurableObject<Env> {
       requireValue(this.count('SELECT COUNT(*) AS count FROM messages') < 10_000, 429);
       // Retained acknowledged/blocked rows are also dedup receipts until original expiry.
       this.sql.exec("INSERT INTO messages (id, sender, recipient, message, status, created_at, expires_at) VALUES (?, ?, ?, ?, 'pending', ?, ?)", id, from, to, encoded, now, expiresAt);
+      stored = to;
       return json({ id, duplicate: false });
     });
+    // The row is committed, so a woken poll re-reads it under the recipient's own grants.
+    if (stored !== undefined) this.wake(stored);
+    return response;
+  }
+
+  // Administration accepts a full identity id or a unique hexadecimal prefix of one.
+  private resolveId(value: unknown): string {
+    requireValue(typeof value === 'string' && ID_PREFIX_PATTERN.test(value));
+    if (ID_PATTERN.test(value)) return value;
+    const matches = this.sql.exec<{ id: string }>('SELECT id FROM agents WHERE substr(id, 1, ?) = ? LIMIT 2', value.length, value).toArray();
+    requireValue(matches.length > 0, 404);
+    requireValue(matches.length === 1, 409);
+    return matches[0].id;
+  }
+
+  private peerIds(value: unknown, exclude: string): string[] {
+    if (value === undefined) return [];
+    requireValue(Array.isArray(value) && value.length <= 16);
+    const ids = new Set((value as unknown[]).map(entry => this.resolveId(entry)));
+    ids.delete(exclude);
+    for (const id of ids) this.active(id);
+    return [...ids];
+  }
+
+  private link(from: string, to: string): void {
+    this.sql.exec('INSERT OR IGNORE INTO grants (from_id, to_id) VALUES (?, ?)', from, to);
+    this.sql.exec('INSERT OR IGNORE INTO grants (from_id, to_id) VALUES (?, ?)', to, from);
   }
 
   private adminOperation(path: string, body: Record<string, unknown>, now: number): Response {
@@ -525,27 +672,35 @@ export class Network extends DurableObject<Env> {
         return json({ events });
       }
       case '/v1/admin/messages': {
-        fields(body, body.agent === undefined ? [] : ['agent']);
-        const agent = body.agent === undefined ? null : identityId(body.agent);
+        optionalFields(body, ['agent']);
+        const agent = body.agent === undefined ? null : this.resolveId(body.agent);
         const rows = agent === null
           ? this.sql.exec<{ message: string; status: string }>('SELECT message, status FROM messages ORDER BY created_at DESC, id DESC LIMIT 100')
           : this.sql.exec<{ message: string; status: string }>('SELECT message, status FROM messages WHERE sender = ? OR recipient = ? ORDER BY created_at DESC, id DESC LIMIT 100', agent, agent);
         return messagePage(rows, row => ({ message: JSON.parse(row.message) as Message, status: row.status }), 2 * 1024 * 1024);
       }
       case '/v1/admin/approve': {
-        fields(body, ['id', 'name']);
-        const id = identityId(body.id);
+        optionalFields(body, ['id', 'name', 'grantWith']);
+        const id = this.resolveId(body.id);
         requireValue(typeof body.name === 'string' && NAME_PATTERN.test(body.name));
         const agent = this.agent(id);
         requireValue(agent?.status === 'pending' && agent.expires_at !== null && agent.expires_at > now, 409);
         requireValue(this.sql.exec('SELECT 1 FROM agents WHERE name = ?', body.name).toArray().length === 0, 409);
+        // Resolved after the approval itself is known to be valid, so a bad peer list
+        // cannot mask a stale or already-approved enrollment.
+        const peers = this.peerIds(body.grantWith, id);
         this.sql.exec("UPDATE agents SET name = ?, status = 'active', expires_at = NULL WHERE id = ?", body.name, id);
         this.audit('approve', id, now);
-        return json({ id, status: 'active', name: body.name });
+        for (const peer of peers) {
+          this.link(id, peer);
+          this.audit('grant', `${id}:${peer}`, now);
+          this.audit('grant', `${peer}:${id}`, now);
+        }
+        return json({ id, status: 'active', name: body.name, mutualGrants: peers.length });
       }
       case '/v1/admin/rename': {
         fields(body, ['id', 'name']);
-        const id = identityId(body.id);
+        const id = this.resolveId(body.id);
         requireValue(typeof body.name === 'string' && NAME_PATTERN.test(body.name));
         requireValue(this.agent(id)?.status === 'active', 409);
         requireValue(this.sql.exec('SELECT 1 FROM agents WHERE name = ?', body.name).toArray().length === 0, 409);
@@ -555,7 +710,7 @@ export class Network extends DurableObject<Env> {
       }
       case '/v1/admin/revoke': {
         fields(body, ['id']);
-        const id = identityId(body.id);
+        const id = this.resolveId(body.id);
         requireValue(this.agent(id), 404);
         this.sql.exec("UPDATE agents SET status = 'revoked', expires_at = NULL WHERE id = ?", id);
         this.sql.exec('DELETE FROM grants WHERE from_id = ? OR to_id = ?', id, id);
@@ -565,8 +720,8 @@ export class Network extends DurableObject<Env> {
       }
       case '/v1/admin/grant': {
         fields(body, ['from', 'to', 'allow']);
-        const from = identityId(body.from);
-        const to = identityId(body.to);
+        const from = this.resolveId(body.from);
+        const to = this.resolveId(body.to);
         requireValue(typeof body.allow === 'boolean');
         this.active(from);
         this.active(to);
@@ -578,6 +733,43 @@ export class Network extends DurableObject<Env> {
         }
         this.audit(body.allow ? 'grant' : 'ungrant', `${from}:${to}`, now);
         return json({ from, to, allow: body.allow });
+      }
+      case '/v1/admin/mesh': {
+        fields(body, ['ids']);
+        requireValue(Array.isArray(body.ids) && body.ids.length >= 2 && body.ids.length <= 16);
+        const ids = new Set((body.ids as unknown[]).map(entry => this.resolveId(entry)));
+        requireValue(ids.size >= 2);
+        for (const id of ids) this.active(id);
+        const list = [...ids];
+        let edges = 0;
+        for (let i = 0; i < list.length; i += 1) {
+          for (let j = i + 1; j < list.length; j += 1) {
+            this.link(list[i], list[j]);
+            edges += 2;
+          }
+        }
+        this.audit('mesh', `${list.length} agents`, now);
+        return json({ edges });
+      }
+      case '/v1/admin/status': {
+        fields(body, []);
+        const agents = this.sql.exec<{ id: string; name: string | null; status: string; last_seen: number | null; pending: number }>(`
+          SELECT a.id, a.name, a.status, a.last_seen,
+            (SELECT COUNT(*) FROM messages m WHERE m.recipient = a.id AND m.status = 'pending' AND m.expires_at > ?) AS pending
+          FROM agents a ORDER BY a.name, a.id LIMIT 1000
+        `, now).toArray();
+        const totals = this.sql.exec<{ active: number; pending: number; revoked: number; messages: number; pendingMessages: number }>(`
+          SELECT
+            (SELECT COUNT(*) FROM agents WHERE status = 'active') AS active,
+            (SELECT COUNT(*) FROM agents WHERE status = 'pending') AS pending,
+            (SELECT COUNT(*) FROM agents WHERE status = 'revoked') AS revoked,
+            (SELECT COUNT(*) FROM messages) AS messages,
+            (SELECT COUNT(*) FROM messages WHERE status = 'pending' AND expires_at > ?) AS pendingMessages
+        `, now).one();
+        return json({
+          agents: agents.map(agent => ({ id: agent.id, name: agent.name, status: agent.status, pending: agent.pending, lastSeen: agent.last_seen })),
+          totals,
+        });
       }
       default: throw new HttpError(404);
     }
