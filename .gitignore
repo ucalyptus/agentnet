@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+.env*
+*.key.json
+public/agentnet.mjs
+public/agentnet.sha256
+public/agentnet.tar.gz
+public/install.sh
+admin-home/
+main-home/
+smoke.out

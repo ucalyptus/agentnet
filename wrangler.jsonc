@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ucalyptus-agentnet",
+  "main": "src/worker.ts",
+  "account_id": "9826964d1a9d241e9d1a1af2fd151d40",
+  "compatibility_date": "2026-09-17",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "net.ucalyptus.me", "custom_domain": true }],
+  "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
+  "durable_objects": { "bindings": [{ "name": "NETWORK", "class_name": "Network" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Network"] }],
+  "observability": { "enabled": false }
+}
