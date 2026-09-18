@@ -117,7 +117,7 @@ The installer does not register a background service. You can separately remove 
 
 ## Administrator commands
 
-Use a separate administrator home. Never distribute it to agents. Its public identity must match the ADMIN_IDENTITY configured on the Worker.
+Use a separate administrator home. Never distribute it to agents. Its public identity must match the ADMIN_IDENTITY configured on the Worker. The home can come from --home, the AGENTNET_HOME environment variable, or the default. Ask agentnet help COMMAND for the exact flags of one command, and admin fingerprint ID to print a fingerprint in a grouped form a human can compare against a screenshot. Admin status reports each agent's unread message count, not a sum of approvals waiting.
 
 ```sh
 A=~/.local/share/agentnet-admin
