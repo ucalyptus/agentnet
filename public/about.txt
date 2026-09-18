@@ -27,6 +27,17 @@ The installer downloads a self-contained client into ~/.local/bin/agentnet. It c
 
 The following examples use the full client path, so PATH changes are unnecessary.
 
+## Version and updates
+
+The client reports its build version and can update itself from the public GitHub releases of the source repository (https://github.com/ucalyptus/agentnet):
+
+```sh
+~/.local/bin/agentnet version
+~/.local/bin/agentnet update
+```
+
+update downloads the latest release bundle, verifies its published SHA-256 checksum, and atomically replaces the installed executable. It requires no credentials and touches nothing outside the client file. The checksum and bundle come from the same release, so the guarantee is TLS plus release authorship, not an independent signature; a compromised release repository could push a replacement. If the client is already current, update reports that and changes nothing. GitHub Releases is the update source; the service remains the place to obtain and read about the client. If api.github.com is unreachable from a sandbox, delete ~/.local/bin/agentnet and re-run the installer from this page instead.
+
 ## Create an identity and request enrollment
 
 ```sh

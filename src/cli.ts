@@ -1,10 +1,18 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
-import { resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { realpathSync } from 'node:fs';
+import { chmod, lstat, rename, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { AgentClient, ClientError, DEFAULT_HOME, requireCondition } from './client.js';
-import type { MessageBody } from './protocol.js';
+import { record, type MessageBody } from './protocol.js';
+
+const UPDATE_ORIGIN = 'https://api.github.com/repos/ucalyptus/agentnet/releases/latest';
+
+// Replaced at build time from package.json; survives direct source execution via the default.
+declare const __AGENTNET_VERSION__: string | undefined;
+export const VERSION = __AGENTNET_VERSION__ ?? '0.1.1-dev';
 
 const HELP = `Agentnet is a private, admin-controlled message service.
 
@@ -24,6 +32,8 @@ Agent commands:
   receive [--wait]            Print messages; --wait polls every 5 seconds until Ctrl+C.
                               Each message appears once per receive process, without ack.
   ack MESSAGE_ID             Acknowledge receipt explicitly and remove it from your inbox.
+  version                    Show the installed client build version.
+  update                     Replace this client with the latest GitHub release, checksum-verified.
   remove                     Archive this home after interactive fingerprint confirmation.
 
 Admin commands require a separate home:
@@ -80,6 +90,8 @@ const COMMANDS: Record<string, { arity: number; options: readonly string[] }> = 
   inbox: { arity: 0, options: [] },
   receive: { arity: 0, options: ['wait'] },
   ack: { arity: 1, options: [] },
+  version: { arity: 0, options: [] },
+  update: { arity: 0, options: [] },
   remove: { arity: 0, options: [] },
   'admin identity': { arity: 0, options: [] },
   'admin invite': { arity: 0, options: ['out'] },
@@ -103,6 +115,75 @@ export function printJSON(value: unknown): void {
 function requiredOption(value: string | undefined, flag: string): string {
   requireCondition(typeof value === 'string' && value.length > 0, `The ${flag} option is required.`);
   return value;
+}
+function comparableVersion(value: string): number[] {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(value);
+  requireCondition(match, `Unrecognized version format: ${value}`);
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+function versionAtLeast(installed: string, available: string): boolean {
+  const current = comparableVersion(installed);
+  const remote = comparableVersion(available);
+  for (let i = 0; i < 3; i++) {
+    if (current[i] !== remote[i]) return current[i]! > remote[i]!;
+  }
+  return true;
+}
+async function download(url: string, maximum: number): Promise<Uint8Array> {
+  const response = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(30_000) });
+  requireCondition(response.ok, `Download failed (HTTP ${response.status}).`);
+  requireCondition(response.body, 'Download returned no body.');
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      bytes += part.value.byteLength;
+      requireCondition(bytes <= maximum, 'Download exceeds the allowed size.');
+      chunks.push(part.value);
+    }
+  } finally { await reader.cancel(); reader.releaseLock(); }
+  return Buffer.concat(chunks, bytes);
+}
+function asset(release: Record<string, unknown>, name: string): { name: string; url: string } | undefined {
+  if (!Array.isArray(release.assets)) return undefined;
+  for (const value of release.assets) {
+    const item = record(value);
+    if (item.name === name && typeof item.browser_download_url === 'string' && item.browser_download_url.startsWith('https://')) {
+      return { name, url: item.browser_download_url };
+    }
+  }
+  return undefined;
+}
+async function updateSelf(): Promise<{ previous: string; installed: string; changed: boolean; source: string }> {
+  requireCondition(typeof process.execPath === 'string' && process.execPath.length > 0, 'Cannot locate this client executable.');
+  const executable = process.execPath as string;
+  const details = await lstat(executable);
+  requireCondition(details.isFile() && !details.isSymbolicLink(), 'Refusing to replace a missing, linked, or non-file client path.');
+  const response = await fetch(UPDATE_ORIGIN, { headers: { accept: 'application/vnd.github+json' }, redirect: 'error', signal: AbortSignal.timeout(20_000) });
+  requireCondition(response.ok, `Update check failed (HTTP ${response.status}); retry later or reinstall from https://net.ucalyptus.me.`);
+  const release = record(JSON.parse(await response.text()));
+  const tag = release.tag_name;
+  requireCondition(typeof tag === 'string' && /^v\d+\.\d+\.\d+$/.test(tag), 'Latest GitHub release has an unexpected tag.');
+  const latest = tag.slice(1);
+  if (versionAtLeast(VERSION, latest)) return { previous: VERSION, installed: VERSION, changed: false, source: 'https://github.com/ucalyptus/agentnet/releases' };
+  const bundle = asset(release, 'agentnet.mjs');
+  const checksum = asset(release, 'agentnet.mjs.sha256');
+  requireCondition(bundle && checksum, 'Latest release is missing client assets.');
+  const expected = new TextDecoder().decode(await download(checksum!.url, 1024)).trim();
+  const match = /^([a-f0-9]{64})\s+agentnet\.mjs$/.exec(expected);
+  requireCondition(match, 'Release checksum file is malformed.');
+  const binary = await download(bundle!.url, 8 * 1024 * 1024);
+  const actual = createHash('sha256').update(binary).digest('hex');
+  requireCondition(actual === match[1], 'Release checksum mismatch; refusing to replace this client.');
+  const directory = dirname(executable);
+  const temporary = join(directory, `.agentnet-update-${randomUUID()}.tmp`);
+  await writeFile(temporary, binary, { mode: 0o700, flag: 'wx' });
+  await rename(temporary, executable);
+  await chmod(executable, 0o700);
+  return { previous: VERSION, installed: latest, changed: true, source: 'https://github.com/ucalyptus/agentnet/releases' };
 }
 
 export async function main(args: string[] = process.argv.slice(2)): Promise<void> {
@@ -140,6 +221,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<void
     printJSON({ id: client.publicIdentity().id, role: client.config.role, server: client.config.server, home });
     return;
   }
+  if (command === 'version') { printJSON({ version: VERSION, latestSource: 'https://github.com/ucalyptus/agentnet/releases' }); return; }
+  if (command === 'update') { printJSON(await updateSelf()); return; }
   const client = await AgentClient.load(home);
   if (command.startsWith('admin ')) client.requireRole('admin');
   switch (command) {
