@@ -8,9 +8,27 @@ case "$origin" in
   *) echo 'An HTTPS origin is required.' >&2; exit 1 ;;
 esac
 origin=${origin%/}
-node -e 'if (Number(process.versions.node.split(".")[0]) < 22) process.exit(1)' || {
-  echo 'Node.js 22 or newer is required.' >&2; exit 1;
-}
+# Find an interpreter that is actually new enough. `node` on PATH is often an older LTS,
+# and a client installed with #!/usr/bin/env node would then silently run on the wrong one.
+pinned=''
+for candidate in "${AGENTNET_NODE:-}" "$(command -v node 2>/dev/null || true)" "$(command -v node22 2>/dev/null || true)" "$HOME/.local/bin/node" /opt/homebrew/bin/node /usr/local/bin/node; do
+  [ -n "$candidate" ] || continue
+  [ -x "$candidate" ] || continue
+  if "$candidate" -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)' 2>/dev/null; then
+    pinned=$("$candidate" -e 'console.log(process.execPath)')
+    break
+  fi
+done
+if [ -z "$pinned" ]; then
+  echo 'Node.js 22 or newer is required, and none was found.' >&2
+  echo 'Install one, then re-run this script (set AGENTNET_NODE=/path/to/node to choose it explicitly):' >&2
+  echo '  macOS:  brew install node@22' >&2
+  echo '  Linux:  curl -fsSL https://nodejs.org/dist/v22.20.0/node-v22.20.0-linux-x64.tar.xz | tar -xJ -C "$HOME/.local" --strip-components=1' >&2
+  echo '  nvm:    nvm install 22' >&2
+  exit 1
+fi
+node() { "$pinned" "$@"; }
+printf 'Using Node %s at %s\n' "$("$pinned" -e 'console.log(process.versions.node)')" "$pinned"
 dest="$HOME/.local/bin/agentnet"
 if [ -e "$dest" ] || [ -L "$dest" ]; then
   echo "Refusing to overwrite $dest. Move your previous client aside first." >&2
@@ -32,9 +50,15 @@ if (actual !== expected.slice(0, 64)) throw new Error('Client checksum mismatch'
 NODE
 mkdir -p "$HOME/.local/bin"
 # Exclusive creation prevents overwriting an existing executable or following its symlink.
-node --input-type=module - "$tmp/agentnet.mjs" "$dest" <<'NODE'
-import { copyFileSync, chmodSync, constants } from 'node:fs';
-copyFileSync(process.argv[2], process.argv[3], constants.COPYFILE_EXCL);
-chmodSync(process.argv[3], 0o700);
+# The checksum is verified against the downloaded bytes above; only afterwards is the
+# shebang rewritten to the interpreter validated here, so `env node` cannot later resolve
+# to an older Node. `agentnet update` preserves this pinned line.
+node --input-type=module - "$tmp/agentnet.mjs" "$dest" "$pinned" <<'NODE'
+import { readFileSync, writeFileSync, chmodSync, constants } from 'node:fs';
+const [, , source, destination, interpreter] = process.argv;
+const bundle = readFileSync(source, 'utf8');
+const body = bundle.startsWith('#!') ? bundle.slice(bundle.indexOf('\n') + 1) : bundle;
+writeFileSync(destination, `#!${interpreter}\n${body}`, { mode: 0o700, flag: 'wx' });
+chmodSync(destination, 0o700);
 NODE
-printf 'Installed %s\nRun it by its full path, or add ~/.local/bin to PATH.\n' "$dest"
+printf 'Installed %s (pinned to %s)\nRun it by its full path, or add ~/.local/bin to PATH.\nNext: %s doctor\n' "$dest" "$pinned" "$dest"

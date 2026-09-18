@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import { base64url, decodeJwt } from 'jose';
 import {
-  ID_PATTERN, MAX_REQUEST_BYTES, UUID_PATTERN,
+  ID_PATTERN, MAX_IDENTITIES, MAX_REQUEST_BYTES, UUID_PATTERN,
   record, sha256, validateMessage, validatePublicIdentity, verifyRequest,
   type Message, type PublicIdentity,
 } from './protocol.ts';
@@ -16,8 +16,11 @@ const MINUTE = 60_000;
 const PENDING_TTL = 24 * 60 * MINUTE;
 const INVITE_TTL = 60 * MINUTE;
 const AUDIT_TTL = 30 * 24 * 60 * MINUTE;
-const INBOX_WAIT = 25_000;
-const MAX_INBOX_WAITERS = 4;
+const HOLD_WINDOW = 25_000;
+const MAX_WAITERS = 4;
+// Long poll registry keys are namespaced, so an identity's inbox and status holds are
+// independent. New enrollments share one key: only the administrator waits on them.
+const PENDING_KEY = 'enrollment';
 const API_PATHS: Record<string, true> = {
   '/v1/enroll': true, '/v1/status': true, '/v1/peers': true,
   '/v1/send': true, '/v1/inbox': true, '/v1/ack': true,
@@ -44,13 +47,16 @@ type AgentRow = {
   expires_at: number | null;
   last_seen: number | null;
 };
-type InvitationRow = { hash: string; expires_at: number; name: string | null; auto_approve: number | null };
+type InvitationRow = { hash: string; expires_at: number; name: string | null; auto_approve: number | null; bound_id: string | null };
 type InboxRow = { message: string; identity: string; name: string };
-// Returned by a long-polling inbox read that found nothing, so the caller can wait unlocked.
-type InboxHold = { hold: string };
+// Returned by a long-polling read that found nothing yet, so the caller can wait unlocked.
+// resume() re-reads once the hold ends: null means the wait is not satisfied and must
+// continue, and an expired hold always produces a response.
+type Hold = { key: string; resume: (expired: boolean) => Response | null };
 type Authenticated = {
   identity: PublicIdentity;
   admin: boolean;
+  adminKey: PublicIdentity;
   nonce: string;
   invitationHash: string | undefined;
 };
@@ -263,6 +269,7 @@ export class Network extends DurableObject<Env> {
       ['agents', 'last_seen', 'INTEGER'],
       ['invitations', 'name', 'TEXT'],
       ['invitations', 'auto_approve', 'INTEGER'],
+      ['invitations', 'bound_id', 'TEXT'],
     ];
     for (const [table, column, type] of additions) {
       const present = this.sql.exec<{ name: string }>(`PRAGMA table_info(${table})`).toArray().some(row => row.name === column);
@@ -270,31 +277,31 @@ export class Network extends DurableObject<Env> {
     }
   }
 
-  // Called after a message row commits, never while a transaction or lock is held.
-  private wake(recipient: string): void {
-    const waiting = this.waiters.get(recipient);
+  // Called after the relevant row commits, never while a transaction or lock is held.
+  private wake(key: string): void {
+    const waiting = this.waiters.get(key);
     if (!waiting) return;
-    this.waiters.delete(recipient);
+    this.waiters.delete(key);
     for (const resolve of waiting) resolve();
   }
 
-  private async hold(recipient: string): Promise<void> {
-    const waiting = this.waiters.get(recipient) ?? new Set<() => void>();
-    requireValue(waiting.size < MAX_INBOX_WAITERS, 429);
-    this.waiters.set(recipient, waiting);
+  private async hold(key: string, deadline: number): Promise<void> {
+    const waiting = this.waiters.get(key) ?? new Set<() => void>();
+    requireValue(waiting.size < MAX_WAITERS, 429);
+    this.waiters.set(key, waiting);
     let resolve!: () => void;
-    const delivered = new Promise<void>(settle => { resolve = () => settle(); });
+    const woken = new Promise<void>(settle => { resolve = () => settle(); });
     waiting.add(resolve);
-    // One resolver ends the wait, whether a message arrived or the deadline expired.
-    const timer = setTimeout(resolve, INBOX_WAIT);
+    // One resolver ends the wait, whether the awaited change landed or the window closed.
+    const timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
     try {
-      await delivered;
+      await woken;
     } finally {
       clearTimeout(timer);
-      const current = this.waiters.get(recipient);
+      const current = this.waiters.get(key);
       if (current) {
         current.delete(resolve);
-        if (current.size === 0) this.waiters.delete(recipient);
+        if (current.size === 0) this.waiters.delete(key);
       }
     }
   }
@@ -322,8 +329,14 @@ export class Network extends DurableObject<Env> {
       // other agents keep sending, acknowledging and being administered during a hold.
       // The nonce was already consumed above: waiting never re-authenticates.
       try {
-        await this.hold(result.hold);
-        return this.inbox(result.hold);
+        const deadline = Date.now() + HOLD_WINDOW;
+        for (;;) {
+          await this.hold(result.key, deadline);
+          // A spurious wake (a rename while a status hold waits) re-waits. An expired
+          // hold always yields a response, so the deadline bounds this loop.
+          const response = result.resume(Date.now() >= deadline);
+          if (response) return response;
+        }
       } catch (error) { return failure(error); }
     } catch (error) { return failure(error); }
   }
@@ -449,43 +462,62 @@ export class Network extends DurableObject<Env> {
       requireValue(identity.id !== admin.id, 403);
       if (path !== '/v1/enroll' && path !== '/v1/status') this.active(identity.id);
     }
-    return { identity, admin: isAdmin, nonce: proof.nonce, invitationHash };
+    // adminKey travels with the request: /v1/status publishes it, and a status hold that
+    // resumes outside the lock must not re-read configuration to answer.
+    return { identity, admin: isAdmin, adminKey: admin, nonce: proof.nonce, invitationHash };
   }
 
-  private async dispatch(path: string, body: Record<string, unknown>, auth: Authenticated): Promise<Response | InboxHold> {
+  private async dispatch(path: string, body: Record<string, unknown>, auth: Authenticated): Promise<Response | Hold> {
     switch (path) {
       case '/v1/enroll': return this.enroll(body, auth);
       case '/v1/send': return this.send(body, auth);
       case '/v1/admin/invite': return this.invite(body, auth);
-      default:
-        return this.ctx.storage.transactionSync(() => {
+      default: {
+        // Wake keys are collected inside the transaction and fired once it has committed.
+        const woken: string[] = [];
+        const result = this.ctx.storage.transactionSync((): Response | Hold => {
           const now = Date.now();
           this.cleanup(now);
           if (path.startsWith('/v1/admin/')) {
             requireValue(auth.admin, 403);
-            return this.adminOperation(path, body, now);
+            return this.adminOperation(path, body, now, woken);
           }
           if (path === '/v1/status') {
-            fields(body, []);
+            optionalFields(body, ['wait']);
+            requireValue(body.wait === undefined || typeof body.wait === 'boolean');
             const agent = this.agent(auth.identity.id);
             requireValue(agent, 403);
-            return json({ id: agent.id, status: agent.status, name: agent.name, serverTime: now });
+            // Pending and revoked identities may wait here: status is the only endpoint
+            // they can call, so approval becomes observable without polling.
+            if (body.wait === true) {
+              const before = agent.status;
+              return { key: `status:${agent.id}`, resume: expired => this.statusChange(agent.id, before, auth.adminKey, expired) };
+            }
+            return this.status(agent, auth.adminKey, now);
           }
           this.active(auth.identity.id);
           switch (path) {
             case '/v1/peers': {
               fields(body, []);
-              const peers = this.sql.exec<{ name: string; identity: string }>(`
-                SELECT a.name, a.identity FROM grants g JOIN agents a ON a.id = g.to_id
+              // The reverse grant is joined in, so a caller knows whether a reply can return.
+              const peers = this.sql.exec<{ name: string; identity: string; inbound: number }>(`
+                SELECT a.name, a.identity, (r.to_id IS NOT NULL) AS inbound FROM grants g
+                JOIN agents a ON a.id = g.to_id
+                LEFT JOIN grants r ON r.from_id = g.to_id AND r.to_id = g.from_id
                 WHERE g.from_id = ? AND a.status = 'active' ORDER BY a.name
-              `, auth.identity.id).toArray().map(peer => ({ name: peer.name, identity: JSON.parse(peer.identity) as PublicIdentity }));
+              `, auth.identity.id).toArray().map(peer => ({
+                name: peer.name, identity: JSON.parse(peer.identity) as PublicIdentity, inbound: peer.inbound === 1,
+              }));
               return json({ peers });
             }
             case '/v1/inbox': {
               optionalFields(body, ['wait']);
               requireValue(body.wait === undefined || typeof body.wait === 'boolean');
               const rows = this.inboxRows(auth.identity.id, now);
-              if (rows.length === 0 && body.wait === true) return { hold: auth.identity.id };
+              if (rows.length === 0 && body.wait === true) {
+                const id = auth.identity.id;
+                return { key: `inbox:${id}`, resume: () => this.inbox(id) };
+              }
               return inboxPage(rows);
             }
             case '/v1/ack': {
@@ -501,6 +533,9 @@ export class Network extends DurableObject<Env> {
             default: throw new HttpError(404);
           }
         });
+        for (const key of woken) this.wake(key);
+        return result;
+      }
     }
   }
 
@@ -524,19 +559,57 @@ export class Network extends DurableObject<Env> {
     });
   }
 
+  private status(agent: AgentRow, adminKey: PublicIdentity, now: number): Response {
+    return json({ id: agent.id, status: agent.status, name: agent.name, serverTime: now, adminKey });
+  }
+
+  // Second read of a status long poll: it resolves only once the stored status differs
+  // from the one this request authenticated against, so a rename cannot end the wait.
+  private statusChange(id: string, before: AgentRow['status'], adminKey: PublicIdentity, expired: boolean): Response | null {
+    return this.ctx.storage.transactionSync(() => {
+      const now = Date.now();
+      this.cleanup(now);
+      const agent = this.agent(id);
+      requireValue(agent, 403);
+      if (!expired && agent.status === before) return null;
+      return this.status(agent, adminKey, now);
+    });
+  }
+
+  private pendingRows(now: number): AgentRow[] {
+    return this.sql.exec<AgentRow>("SELECT * FROM agents WHERE status = 'pending' AND expires_at > ? ORDER BY created_at, id", now).toArray();
+  }
+
+  private pendingPage(agents: AgentRow[]): Response {
+    return json({ agents: agents.map(agent => ({ identity: JSON.parse(agent.identity) as PublicIdentity, createdAt: agent.created_at })) });
+  }
+
+  // Second read of a pending long poll: enrollments committed during the wait are included.
+  private pending(): Response {
+    return this.ctx.storage.transactionSync(() => {
+      const now = Date.now();
+      this.cleanup(now);
+      return this.pendingPage(this.pendingRows(now));
+    });
+  }
+
   private enroll(body: Record<string, unknown>, auth: Authenticated): Response {
     fields(body, ['identity', 'invite']);
     requireValue(typeof body.invite === 'string' && INVITE_PATTERN.test(body.invite));
-    return this.ctx.storage.transactionSync(() => {
+    let requested = false;
+    const response = this.ctx.storage.transactionSync(() => {
       const now = Date.now();
       this.cleanup(now);
       requireValue(!auth.admin, 403);
       requireValue(!this.agent(auth.identity.id), 409);
       const hash = auth.invitationHash;
       requireValue(typeof hash === 'string', 403);
-      const invitation = this.sql.exec<InvitationRow>('SELECT hash, expires_at, name, auto_approve FROM invitations WHERE hash = ? AND expires_at > ?', hash, now).toArray()[0];
+      const invitation = this.sql.exec<InvitationRow>('SELECT hash, expires_at, name, auto_approve, bound_id FROM invitations WHERE hash = ? AND expires_at > ?', hash, now).toArray()[0];
       requireValue(invitation, 403);
-      requireValue(this.count('SELECT COUNT(*) AS count FROM agents') < 1000, 429);
+      // A bound invitation belongs to one fingerprint; legacy rows carry no binding.
+      // Refusing before the DELETE rolls back, so the intended holder can still enroll.
+      requireValue(typeof invitation.bound_id !== 'string' || invitation.bound_id === auth.identity.id, 403);
+      requireValue(this.count('SELECT COUNT(*) AS count FROM agents') < MAX_IDENTITIES, 429);
       const reserved = invitation.auto_approve === 1 && typeof invitation.name === 'string' && NAME_PATTERN.test(invitation.name) ? invitation.name : null;
       if (reserved === null) {
         requireValue(this.count("SELECT COUNT(*) AS count FROM agents WHERE status = 'pending'") < 100, 429);
@@ -552,15 +625,21 @@ export class Network extends DurableObject<Env> {
         now, reserved === null ? now + PENDING_TTL : null, now,
       );
       this.audit('enroll', auth.identity.id, now);
-      if (reserved === null) return json({ id: auth.identity.id, status: 'pending' });
+      if (reserved === null) {
+        requested = true;
+        return json({ id: auth.identity.id, status: 'pending' });
+      }
       // Deny by default is unchanged: an auto-approved agent starts with no grants.
       this.audit('approve', auth.identity.id, now);
       return json({ id: auth.identity.id, status: 'active', name: reserved });
     });
+    // The row is committed, so a waiting administrator reads the request for itself.
+    if (requested) this.wake(PENDING_KEY);
+    return response;
   }
 
   private async invite(body: Record<string, unknown>, auth: Authenticated): Promise<Response> {
-    optionalFields(body, ['name', 'autoApprove']);
+    optionalFields(body, ['name', 'autoApprove', 'for']);
     requireValue(auth.admin, 403);
     let name: string | null = null;
     if (body.name !== undefined) {
@@ -572,6 +651,8 @@ export class Network extends DurableObject<Env> {
       requireValue(typeof body.autoApprove === 'boolean');
       autoApprove = body.autoApprove;
     }
+    // A bound invitation names the exact fingerprint allowed to consume it.
+    const bound = body.for === undefined ? null : identityId(body.for);
     // An invitation that approves itself must carry the name it will claim.
     requireValue(!autoApprove || name !== null);
     this.rate(`invite:${auth.identity.id}`, auth.nonce, 10);
@@ -583,16 +664,16 @@ export class Network extends DurableObject<Env> {
       const invitations = this.count('SELECT COUNT(*) AS count FROM invitations');
       const pending = this.count("SELECT COUNT(*) AS count FROM agents WHERE status = 'pending'");
       requireValue(invitations + pending < 100, 429);
-      requireValue(this.count('SELECT COUNT(*) AS count FROM agents') + invitations < 1000, 429);
+      requireValue(this.count('SELECT COUNT(*) AS count FROM agents') + invitations < MAX_IDENTITIES, 429);
       if (name !== null) {
         requireValue(this.sql.exec('SELECT 1 FROM agents WHERE name = ?', name).toArray().length === 0, 409);
         requireValue(this.sql.exec('SELECT 1 FROM invitations WHERE name = ? AND expires_at > ?', name, now).toArray().length === 0, 409);
       }
       const expiresAt = now + INVITE_TTL;
       // Only the invitation digest is stored; the token itself never reaches storage.
-      this.sql.exec('INSERT INTO invitations (hash, expires_at, name, auto_approve) VALUES (?, ?, ?, ?)', hash, expiresAt, name, autoApprove ? 1 : 0);
+      this.sql.exec('INSERT INTO invitations (hash, expires_at, name, auto_approve, bound_id) VALUES (?, ?, ?, ?, ?)', hash, expiresAt, name, autoApprove ? 1 : 0, bound);
       this.audit('invite', auth.identity.id, now);
-      return json({ invite, expiresAt, autoApprove, name });
+      return json({ invite, expiresAt, autoApprove, name, for: bound });
     });
   }
 
@@ -614,20 +695,26 @@ export class Network extends DurableObject<Env> {
       const { id, from, to, createdAt, expiresAt, kind, text } = message;
       const encoded = JSON.stringify({ id, from, to, createdAt, expiresAt, kind, text });
       const previous = this.sql.exec<{ sender: string; recipient: string; message: string }>('SELECT sender, recipient, message FROM messages WHERE id = ?', id).toArray()[0];
+      // recipientPending is read in the same transaction as the insert, so the depth a
+      // sender is told is exactly the one its own message produced: a backpressure signal.
       if (previous) {
         requireValue(previous.sender === from && previous.recipient === to && previous.message === encoded, 409);
-        return json({ id, duplicate: true });
+        return json({ id, duplicate: true, recipientPending: this.pendingFor(to) });
       }
-      requireValue(this.count("SELECT COUNT(*) AS count FROM messages WHERE recipient = ? AND status = 'pending'", to) < 100, 429);
+      requireValue(this.pendingFor(to) < 100, 429);
       requireValue(this.count('SELECT COUNT(*) AS count FROM messages') < 10_000, 429);
       // Retained acknowledged/blocked rows are also dedup receipts until original expiry.
       this.sql.exec("INSERT INTO messages (id, sender, recipient, message, status, created_at, expires_at) VALUES (?, ?, ?, ?, 'pending', ?, ?)", id, from, to, encoded, now, expiresAt);
       stored = to;
-      return json({ id, duplicate: false });
+      return json({ id, duplicate: false, recipientPending: this.pendingFor(to) });
     });
     // The row is committed, so a woken poll re-reads it under the recipient's own grants.
-    if (stored !== undefined) this.wake(stored);
+    if (stored !== undefined) this.wake(`inbox:${stored}`);
     return response;
+  }
+
+  private pendingFor(recipient: string): number {
+    return this.count("SELECT COUNT(*) AS count FROM messages WHERE recipient = ? AND status = 'pending'", recipient);
   }
 
   // Administration accepts a full identity id or a unique hexadecimal prefix of one.
@@ -654,12 +741,15 @@ export class Network extends DurableObject<Env> {
     this.sql.exec('INSERT OR IGNORE INTO grants (from_id, to_id) VALUES (?, ?)', to, from);
   }
 
-  private adminOperation(path: string, body: Record<string, unknown>, now: number): Response {
+  private adminOperation(path: string, body: Record<string, unknown>, now: number, woken: string[]): Response | Hold {
     switch (path) {
       case '/v1/admin/pending': {
-        fields(body, []);
-        const agents = this.sql.exec<AgentRow>("SELECT * FROM agents WHERE status = 'pending' AND expires_at > ? ORDER BY created_at, id", now).toArray();
-        return json({ agents: agents.map(agent => ({ identity: JSON.parse(agent.identity) as PublicIdentity, createdAt: agent.created_at })) });
+        optionalFields(body, ['wait']);
+        requireValue(body.wait === undefined || typeof body.wait === 'boolean');
+        const agents = this.pendingRows(now);
+        // The enroll path resolves this wait once a pending row has committed.
+        if (agents.length === 0 && body.wait === true) return { key: PENDING_KEY, resume: () => this.pending() };
+        return this.pendingPage(agents);
       }
       case '/v1/admin/agents': {
         fields(body, []);
@@ -691,6 +781,7 @@ export class Network extends DurableObject<Env> {
         const peers = this.peerIds(body.grantWith, id);
         this.sql.exec("UPDATE agents SET name = ?, status = 'active', expires_at = NULL WHERE id = ?", body.name, id);
         this.audit('approve', id, now);
+        woken.push(`status:${id}`);
         for (const peer of peers) {
           this.link(id, peer);
           this.audit('grant', `${id}:${peer}`, now);
@@ -706,6 +797,7 @@ export class Network extends DurableObject<Env> {
         requireValue(this.sql.exec('SELECT 1 FROM agents WHERE name = ?', body.name).toArray().length === 0, 409);
         this.sql.exec('UPDATE agents SET name = ? WHERE id = ?', body.name, id);
         this.audit('rename', id, now);
+        woken.push(`status:${id}`);
         return json({ id, name: body.name });
       }
       case '/v1/admin/revoke': {
@@ -716,6 +808,7 @@ export class Network extends DurableObject<Env> {
         this.sql.exec('DELETE FROM grants WHERE from_id = ? OR to_id = ?', id, id);
         this.sql.exec("UPDATE messages SET status = 'blocked' WHERE status = 'pending' AND (sender = ? OR recipient = ?)", id, id);
         this.audit('revoke', id, now);
+        woken.push(`status:${id}`);
         return json({ id, status: 'revoked' });
       }
       case '/v1/admin/grant': {

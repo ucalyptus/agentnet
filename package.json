@@ -1,6 +1,6 @@
 {
   "name": "@ucalyptus/agentnet",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Private, owner-enrolled messaging for personal agents",
@@ -11,7 +11,7 @@
     "node": ">=22.12"
   },
   "scripts": {
-    "build": "node scripts/build.mjs",
+    "build": "node --experimental-strip-types scripts/build.mjs",
     "typecheck": "tsc --noEmit",
     "dev": "wrangler dev -c wrangler.dev.jsonc --ip 127.0.0.1",
     "deploy": "npm run build && wrangler deploy"

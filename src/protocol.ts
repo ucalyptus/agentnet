@@ -1,18 +1,20 @@
 import {
-  SignJWT, calculateJwkThumbprint, exportJWK, generateKeyPair, importJWK,
-  jwtVerify, type JWK,
+  CompactSign, SignJWT, calculateJwkThumbprint, compactVerify, exportJWK,
+  generateKeyPair, importJWK, jwtVerify, type JWK,
 } from 'jose';
 
 export const MESSAGE_TTL = 7 * 24 * 60 * 60 * 1000;
 export const MAX_TEXT_BYTES = 32 * 1024;
 export const MAX_REQUEST_BYTES = 224 * 1024;
+// Revocation tombstones are permanent, so the ceiling has to absorb re-keying over years.
+export const MAX_IDENTITIES = 10_000;
 export const ID_PATTERN = /^[a-f0-9]{64}$/;
 export const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const encoder = new TextEncoder();
 
 export interface PublicIdentity { id: string; signingKey: JWK }
 export interface PrivateIdentity { public: PublicIdentity; signingPrivateKey: JWK }
-export interface MessageBody { kind: 'message' | 'prompt' | 'instruction'; text: string }
+export interface MessageBody { kind: 'message' | 'prompt' | 'instruction' | 'result'; text: string }
 export interface Message extends MessageBody {
   id: string;
   from: string;
@@ -94,7 +96,7 @@ export async function verifyRequest(token: string, identity: PublicIdentity, url
 export function validateMessageBody(value: unknown): MessageBody {
   const body = record(value);
   assert(Object.keys(body).sort().join(',') === 'kind,text', 'Invalid message body fields');
-  assert(['message', 'prompt', 'instruction'].includes(String(body.kind)), 'Invalid message kind');
+  assert(['message', 'prompt', 'instruction', 'result'].includes(String(body.kind)), 'Invalid message kind');
   assert(typeof body.text === 'string' && encoder.encode(body.text).byteLength > 0 && encoder.encode(body.text).byteLength <= MAX_TEXT_BYTES, 'Message must contain 1 to 32768 UTF-8 bytes');
   return body as unknown as MessageBody;
 }
@@ -112,4 +114,27 @@ export function validateMessage(value: unknown, senderId: string, recipientId: s
   assert((m.createdAt as number) <= now + 60_000 && (m.expiresAt as number) > now && (m.expiresAt as number) > (m.createdAt as number) && (m.expiresAt as number) <= (m.createdAt as number) + MESSAGE_TTL && (m.expiresAt as number) <= now + MESSAGE_TTL, 'Message is expired or outside validity window');
   validateMessageBody({ kind: m.kind, text: m.text });
   return m as unknown as Message;
+}
+
+// Release signing closes the same-origin gap: the bundle checksum is signed by the
+// administrator key, which never lives on the server that serves the bundle, so a
+// compromised origin alone cannot ship a client.
+export interface Manifest { version: string; sha256: string }
+function validateManifest(value: unknown): Manifest {
+  const manifest = record(value);
+  assert(typeof manifest.version === 'string' && /^\d+\.\d+\.\d+$/.test(manifest.version), 'Invalid manifest version');
+  assert(typeof manifest.sha256 === 'string' && /^[a-f0-9]{64}$/.test(manifest.sha256), 'Invalid manifest checksum');
+  return { version: manifest.version, sha256: manifest.sha256 };
+}
+export async function signManifest(identity: PrivateIdentity, manifest: Manifest): Promise<string> {
+  const { version, sha256: digest } = validateManifest(manifest);
+  return new CompactSign(encoder.encode(JSON.stringify({ version, sha256: digest })))
+    .setProtectedHeader({ alg: 'EdDSA', typ: 'agentnet-manifest+jws' })
+    .sign(await importJWK(identity.signingPrivateKey, 'EdDSA'));
+}
+export async function verifyManifest(jws: string, admin: PublicIdentity): Promise<Manifest> {
+  assert(typeof jws === 'string' && jws.length > 0 && jws.length <= 8192, 'Invalid manifest signature');
+  const verified = await compactVerify(jws, await importJWK(admin.signingKey, 'EdDSA'), { algorithms: ['EdDSA'] });
+  assert(verified.protectedHeader.typ === 'agentnet-manifest+jws', 'Invalid manifest signature type');
+  return validateManifest(JSON.parse(new TextDecoder().decode(verified.payload)));
 }
