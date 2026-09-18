@@ -2,7 +2,7 @@
 import { parseArgs } from 'node:util';
 import { dirname, join, resolve } from 'node:path';
 import { realpathSync } from 'node:fs';
-import { chmod, lstat, rename, writeFile } from 'node:fs/promises';
+import { chmod, lstat, readFile, rename, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { AgentClient, ClientError, DEFAULT_HOME, requireCondition } from './client.js';
@@ -158,10 +158,13 @@ function asset(release: Record<string, unknown>, name: string): { name: string; 
   return undefined;
 }
 async function updateSelf(): Promise<{ previous: string; installed: string; changed: boolean; source: string }> {
-  requireCondition(typeof process.execPath === 'string' && process.execPath.length > 0, 'Cannot locate this client executable.');
-  const executable = process.execPath as string;
+  // Replace this script (import.meta.url), never the node interpreter that runs it.
+  const executable = fileURLToPath(import.meta.url);
   const details = await lstat(executable);
   requireCondition(details.isFile() && !details.isSymbolicLink(), 'Refusing to replace a missing, linked, or non-file client path.');
+  requireCondition(details.size <= 4 * 1024 * 1024, 'Client bundle is unexpectedly large; refusing to replace it.');
+  const head = await readFile(executable, 'utf8');
+  requireCondition(head.includes('Agentnet is a private, admin-controlled'), 'Refusing to replace a file that is not the agentnet client bundle.');
   const response = await fetch(UPDATE_ORIGIN, { headers: { accept: 'application/vnd.github+json' }, redirect: 'error', signal: AbortSignal.timeout(20_000) });
   requireCondition(response.ok, `Update check failed (HTTP ${response.status}); retry later or reinstall from https://net.ucalyptus.me.`);
   const release = record(JSON.parse(await response.text()));
