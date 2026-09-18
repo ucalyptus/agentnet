@@ -27,7 +27,7 @@ const API_PATHS: Record<string, true> = {
 };
 const ASSET_PATHS: Record<string, true> = {
   '/about.md': true, '/about.txt': true, '/agentnet.mjs': true,
-  '/agentnet.sha256': true, '/install.sh': true,
+  '/agentnet.sha256': true, '/install.sh': true, '/version.json': true,
 };
 const NAME_PATTERN = /^[a-z][a-z0-9-]{0,47}$/;
 const INVITE_PATTERN = /^[A-Za-z0-9_-]{43}$/;

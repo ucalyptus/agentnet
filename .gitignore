@@ -6,6 +6,7 @@ dist/
 *.key.json
 public/agentnet.mjs
 public/agentnet.sha256
+public/version.json
 public/agentnet.tar.gz
 public/install.sh
 admin-home/

@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { AgentClient, ClientError, DEFAULT_HOME, DEFAULT_SERVER, requireCondition, type TextSource } from './client.js';
 import { record, type MessageBody } from './protocol.js';
 
-const UPDATE_ORIGIN = 'https://api.github.com/repos/ucalyptus/agentnet/releases/latest';
+const GITHUB_LATEST = 'https://api.github.com/repos/ucalyptus/agentnet/releases/latest';
 
 // Replaced at build time from package.json; survives direct source execution via the default.
 declare const __AGENTNET_VERSION__: string | undefined;
@@ -193,13 +193,41 @@ async function download(url: string, maximum: number): Promise<Uint8Array> {
   } finally { await reader.cancel(); reader.releaseLock(); }
   return Buffer.concat(chunks, bytes);
 }
-async function latestRelease(): Promise<{ release: Record<string, unknown>; version: string }> {
-  const response = await fetch(UPDATE_ORIGIN, { headers: { accept: 'application/vnd.github+json' }, redirect: 'error', signal: AbortSignal.timeout(20_000) });
-  requireCondition(response.ok, `Update check failed (HTTP ${response.status}); retry later or reinstall from https://net.ucalyptus.me.`);
+interface Build { version: string; bundleUrl: string; checksum: string | null; checksumUrl: string | null; source: string }
+// The service is primary: it is the origin the client already trusts and reaches, and it
+// has no third-party rate limit. GitHub's unauthenticated API allows 60 requests per hour
+// per IP address, which shared agent sandboxes exhaust, returning HTTP 403.
+async function serviceBuild(origin: string): Promise<Build> {
+  const response = await fetch(`${origin}/version.json`, { headers: { accept: 'application/json' }, redirect: 'error', signal: AbortSignal.timeout(20_000) });
+  requireCondition(response.ok, `Service version manifest unavailable (HTTP ${response.status}).`);
+  const manifest = record(JSON.parse(await response.text()));
+  const version = manifest.version;
+  const sha256 = manifest.sha256;
+  requireCondition(typeof version === 'string' && /^\d+\.\d+\.\d+$/.test(version), 'Service manifest has an unexpected version.');
+  requireCondition(typeof sha256 === 'string' && /^[a-f0-9]{64}$/.test(sha256), 'Service manifest has an unexpected checksum.');
+  return { version, bundleUrl: `${origin}/agentnet.mjs`, checksum: sha256, checksumUrl: null, source: origin };
+}
+async function githubBuild(): Promise<Build> {
+  const response = await fetch(GITHUB_LATEST, { headers: { accept: 'application/vnd.github+json' }, redirect: 'error', signal: AbortSignal.timeout(20_000) });
+  requireCondition(response.ok, response.status === 403
+    ? 'GitHub rejected the release lookup (HTTP 403), which usually means its unauthenticated hourly limit for this IP address is exhausted.'
+    : `GitHub release lookup failed (HTTP ${response.status}).`);
   const release = record(JSON.parse(await response.text()));
   const tag = release.tag_name;
   requireCondition(typeof tag === 'string' && /^v\d+\.\d+\.\d+$/.test(tag), 'Latest GitHub release has an unexpected tag.');
-  return { release, version: (tag as string).slice(1) };
+  const bundle = asset(release, 'agentnet.mjs');
+  const checksum = asset(release, 'agentnet.mjs.sha256');
+  requireCondition(bundle && checksum, 'Latest release is missing client assets.');
+  return { version: tag.slice(1), bundleUrl: bundle!.url, checksum: null, checksumUrl: checksum!.url, source: 'https://github.com/ucalyptus/agentnet/releases' };
+}
+async function latestBuild(origin: string): Promise<Build> {
+  try { return await serviceBuild(origin); }
+  catch (serviceError) {
+    try { return await githubBuild(); }
+    catch (githubError) {
+      throw new ClientError(`No update source reachable. Service: ${serviceError instanceof Error ? serviceError.message : 'failed'} GitHub: ${githubError instanceof Error ? githubError.message : 'failed'}`.slice(0, 280));
+    }
+  }
 }
 function asset(release: Record<string, unknown>, name: string): { name: string; url: string } | undefined {
   if (!Array.isArray(release.assets)) return undefined;
@@ -211,7 +239,7 @@ function asset(release: Record<string, unknown>, name: string): { name: string; 
   }
   return undefined;
 }
-async function updateSelf(): Promise<{ previous: string; installed: string; changed: boolean; source: string }> {
+async function updateSelf(origin: string): Promise<{ previous: string; installed: string; changed: boolean; source: string }> {
   // Replace this script (import.meta.url), never the node interpreter that runs it.
   const executable = fileURLToPath(import.meta.url);
   const details = await lstat(executable);
@@ -219,23 +247,22 @@ async function updateSelf(): Promise<{ previous: string; installed: string; chan
   requireCondition(details.size <= 4 * 1024 * 1024, 'Client bundle is unexpectedly large; refusing to replace it.');
   const head = await readFile(executable, 'utf8');
   requireCondition(head.includes('Agentnet is a private, admin-controlled'), 'Refusing to replace a file that is not the agentnet client bundle.');
-  const { release, version: latest } = await latestRelease();
-  if (versionAtLeast(VERSION, latest)) return { previous: VERSION, installed: VERSION, changed: false, source: 'https://github.com/ucalyptus/agentnet/releases' };
-  const bundle = asset(release, 'agentnet.mjs');
-  const checksum = asset(release, 'agentnet.mjs.sha256');
-  requireCondition(bundle && checksum, 'Latest release is missing client assets.');
-  const expected = new TextDecoder().decode(await download(checksum!.url, 1024)).trim();
-  const match = /^([a-f0-9]{64})\s+agentnet\.mjs$/.exec(expected);
-  requireCondition(match, 'Release checksum file is malformed.');
-  const binary = await download(bundle!.url, 8 * 1024 * 1024);
-  const actual = createHash('sha256').update(binary).digest('hex');
-  requireCondition(actual === match[1], 'Release checksum mismatch; refusing to replace this client.');
-  const directory = dirname(executable);
-  const temporary = join(directory, `.agentnet-update-${randomUUID()}.tmp`);
+  const build = await latestBuild(origin);
+  if (versionAtLeast(VERSION, build.version)) return { previous: VERSION, installed: VERSION, changed: false, source: build.source };
+  let expected = build.checksum;
+  if (expected === null) {
+    const published = new TextDecoder().decode(await download(build.checksumUrl!, 1024)).trim();
+    const match = /^([a-f0-9]{64})\s+agentnet\.mjs$/.exec(published);
+    requireCondition(match, 'Published checksum file is malformed.');
+    expected = match[1]!;
+  }
+  const binary = await download(build.bundleUrl, 8 * 1024 * 1024);
+  requireCondition(createHash('sha256').update(binary).digest('hex') === expected, 'Checksum mismatch; refusing to replace this client.');
+  const temporary = join(dirname(executable), `.agentnet-update-${randomUUID()}.tmp`);
   await writeFile(temporary, binary, { mode: 0o700, flag: 'wx' });
   await rename(temporary, executable);
   await chmod(executable, 0o700);
-  return { previous: VERSION, installed: latest, changed: true, source: 'https://github.com/ucalyptus/agentnet/releases' };
+  return { previous: VERSION, installed: build.version, changed: true, source: build.source };
 }
 
 export async function main(args: string[] = process.argv.slice(2)): Promise<void> {
@@ -276,8 +303,14 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<void
     printJSON({ id: client.publicIdentity().id, role: client.config.role, server: client.config.server, home });
     return;
   }
-  if (command === 'version') { printJSON({ version: VERSION, latestSource: 'https://github.com/ucalyptus/agentnet/releases' }); return; }
-  if (command === 'update') { printJSON(await updateSelf()); return; }
+  if (command === 'version' || command === 'update') {
+    // These work without a usable home; fall back to the published service origin.
+    let origin = DEFAULT_SERVER;
+    try { origin = (await AgentClient.load(home)).config.server; } catch { /* home is optional here */ }
+    if (command === 'version') { printJSON({ version: VERSION, updateSource: origin }); return; }
+    printJSON(await updateSelf(origin));
+    return;
+  }
   const client = await AgentClient.load(home);
   if (command.startsWith('admin ')) client.requireRole('admin');
   switch (command) {
@@ -291,12 +324,15 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<void
       const report = await client.doctor();
       let latest: string | null = null;
       let updateAvailable: boolean | null = null;
+      let updateSource: string | null = null;
       let updateError: string | null = null;
       try {
-        latest = (await latestRelease()).version;
+        const build = await latestBuild(client.config.server);
+        latest = build.version;
+        updateSource = build.source;
         updateAvailable = !versionAtLeast(VERSION, latest);
-      } catch { updateError = 'The GitHub release feed could not be reached.'; }
-      printJSON({ client: { version: VERSION, latest, updateAvailable, error: updateError }, ...report }, 2);
+      } catch { updateError = 'No update source could be reached.'; }
+      printJSON({ client: { version: VERSION, latest, updateAvailable, updateSource, error: updateError }, ...report }, 2);
       return;
     }
     case 'send': {

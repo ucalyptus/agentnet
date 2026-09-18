@@ -13,5 +13,6 @@ await chmod('dist/cli.mjs', 0o755);
 await copyFile('dist/cli.mjs', 'public/agentnet.mjs');
 const digest = createHash('sha256').update(await readFile('dist/cli.mjs')).digest('hex');
 await writeFile('public/agentnet.sha256', `${digest}  agentnet.mjs\n`);
+await writeFile('public/version.json', JSON.stringify({ version, sha256: digest, bundle: '/agentnet.mjs' }) + '\n');
 await copyFile('scripts/install.sh', 'public/install.sh');
-console.log(`Client built: ${digest}`);
+console.log(`Client built: ${version} ${digest}`);
