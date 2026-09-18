@@ -6,7 +6,7 @@ import { chmod, lstat, readFile, rename, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
-  AgentClient, ClientError, DEFAULT_HOME, DEFAULT_SERVER, messageKind, requireCondition,
+  AgentClient, ClientError, DEFAULT_HOME, DEFAULT_SERVER, describeFileError, messageKind, requireCondition,
   type TextSource,
 } from './client.js';
 import { record, verifyManifest, type PublicIdentity } from './protocol.js';
@@ -20,8 +20,10 @@ export const VERSION = __AGENTNET_VERSION__ ?? '0.3.0-dev';
 const HELP = `Agentnet is a private, admin-controlled message service.
 
 Usage: agentnet [--home PATH] COMMAND [OPTIONS]
-Default home: ~/.local/share/agentnet
+Default home: ~/.local/share/agentnet (unless AGENTNET_HOME is set; --home always wins)
 Default server: ${DEFAULT_SERVER}
+Operating references: agent guide https://net.ucalyptus.me/about.md, admin guide https://pasta.ucalyptus.me/usfubktnbs
+Run agentnet help COMMAND or agentnet COMMAND --help for one command's usage.
 Requires Node.js 22 or later on macOS or Linux with POSIX file permissions.
 Run doctor for the installed build, the update channel, and mesh health. It prints the
 current numbers, so nothing here needs to repeat a version.
@@ -82,10 +84,11 @@ Agent commands:
   doctor                      One diagnostic JSON in separate sections: client and
                               updateChannel describe where new builds come from and how the
                               last check was verified; local covers home and identity file
-                              modes, the pinned admin key, and the Node version; mesh covers
-                              enrollment, peer count, inbound grants, reachability, clock
-                              skew, and the recommended poll cadence. An update channel
-                              outage is never a mesh problem.
+                              modes, the admin key state (not-pinned, first-use, trusted,
+                              or replaced), and the Node version; mesh covers enrollment
+                              (admin homes read 'admin'), peer count, inbound grants,
+                              reachability, clock skew, and the recommended poll cadence.
+                              An update channel outage is never a mesh problem.
   version                     Show the installed client build version.
   update                      Replace this client with the latest release. The published
                               checksum is always verified. When this home has pinned an
@@ -100,12 +103,22 @@ Agent commands:
 
 Admin commands require a separate home:
   --home PATH init --admin [--server ORIGIN]
+                                        Admin initialization requires an explicit home
+                                        different from the default agent home; an
+                                        AGENTNET_HOME environment variable counts as
+                                        explicit.
   --home PATH admin identity             Print public JSON for ADMIN_IDENTITY provisioning.
-  --home PATH admin invite --out PATH [--name NAME] [--auto-approve] [--for FINGERPRINT]
+  --home PATH admin invite --out PATH | --out - [--name NAME] [--auto-approve --confirm] [--for FINGERPRINT]
                                         Create a one-use invitation file with mode 0600.
+                                        --out - prints the token to standard output and
+                                        writes no file, so the token never lands on disk.
                                         --name reserves a free name for the enrolling agent.
-                                        --auto-approve requires --name and makes that agent
-                                        active the moment it enrolls, with no second step.
+                                        --auto-approve makes the agent active the moment it
+                                        enrolls; because there is no fingerprint check, the
+                                        token alone admits the agent, so it also requires
+                                        --confirm. The echoed receipt always states the name
+                                        and the binding: the fingerprint, or 'any identity
+                                        with the token'.
                                         --for takes a full 64-character fingerprint and binds
                                         the invitation to it, so a leaked token is useless to
                                         anyone else. Combine it with either other option.
@@ -117,7 +130,7 @@ Admin commands require a separate home:
                                         agents and grants both directions with each of them.
   --home PATH admin rename ID --name NAME
   --home PATH admin agents
-  --home PATH admin status               Every agent with pending counts and last seen time.
+  --home PATH admin status               Every agent with unread counts and last seen time.
   --home PATH admin revoke ID
   --home PATH admin grant FROM TO        Allow one direction between active identities.
   --home PATH admin deny FROM TO         Remove that grant and block pending messages.
@@ -125,10 +138,17 @@ Admin commands require a separate home:
                                         identities. Repeating it changes nothing.
   --home PATH admin messages [--agent ID]
                                         Read up to 100 recent messages, including acked ones.
+  --home PATH admin peers ID            List the peers an identity may send to: name,
+                                        identity, and whether that peer may reply.
+  --home PATH admin fingerprint ID      Resolve a fingerprint or unique prefix and print
+                                        the identity as bare and grouped (four hex, space
+                                        separated) forms for comparison against a screenshot.
   --home PATH admin audit
 
 Admin identity arguments take a full 64-character fingerprint or a unique prefix of at
-least 16 hexadecimal characters. An ambiguous prefix is rejected; nothing is guessed.
+least 16 hexadecimal characters. Grouped fingerprints pasted from a chat screenshot
+(spaces, tabs, colons, or dashes between groups) are stripped before validation. An
+ambiguous prefix is rejected; nothing is guessed.
 --grant-with and mesh also accept server-assigned names; a value that looks like a
 hexadecimal identity prefix is always read as an identity, never as a name.
 Names must match [a-z][a-z0-9-]{0,47}. The service controls names and peer lookup.
@@ -139,7 +159,7 @@ and a send to it reports replyPossible:false. Ask an admin for the reverse grant
 
 A client release is published with a checksum and a manifest signed by the admin key.
 This home pins that key the first time status succeeds, so a later key change stops every
-command instead of silently trusting a new signer. doctor prints the pinned fingerprint.
+command instead of silently trusting a new signer. doctor reports the key state.
 
 Messages are private to this service, not end-to-end encrypted. The service and
 its admin can read plaintext. HTTPS is required except for local development.
@@ -195,7 +215,7 @@ const COMMANDS: Record<string, { arity: number | [number, number]; options: read
   update: { arity: 0, options: [] },
   remove: { arity: 0, options: [] },
   'admin identity': { arity: 0, options: [] },
-  'admin invite': { arity: 0, options: ['out', 'name', 'auto-approve', 'for'] },
+  'admin invite': { arity: 0, options: ['out', 'name', 'auto-approve', 'for', 'confirm'] },
   'admin pending': { arity: 0, options: ['wait'] },
   'admin agents': { arity: 0, options: [] },
   'admin status': { arity: 0, options: [] },
@@ -207,6 +227,81 @@ const COMMANDS: Record<string, { arity: number | [number, number]; options: read
   'admin deny': { arity: 2, options: [] },
   'admin mesh': { arity: [2, 16], options: [] },
   'admin messages': { arity: 0, options: ['agent'] },
+  'admin peers': { arity: 1, options: [] },
+  'admin fingerprint': { arity: 1, options: [] },
+};
+
+// Compact per-command reference for 'agentnet help COMMAND' and 'agentnet COMMAND --help':
+// flags and positionals in one line, then a one-line note. The generic HELP stays for
+// bare help and --help, which list every command and the safety rules.
+const USAGE: Record<string, string> = {
+  init: `agentnet [--home PATH] init [--admin] [--server ORIGIN] [--label TEXT]
+Create an identity once; --admin needs an explicit home different from the default agent home.`,
+  identity: `agentnet [--home PATH] identity
+Print public identity JSON, never the private signing key.`,
+  label: `agentnet [--home PATH] label TEXT
+Set the local label; an empty value clears it.`,
+  enroll: `agentnet [--home PATH] enroll --invite-file PATH | --invite-stdin
+Request enrollment from a private invitation file or token on standard input.`,
+  status: `agentnet [--home PATH] status [--watch]
+Show pending, active, or revoked status and the pinned admin key; --watch waits while pending.`,
+  'trust-admin': `agentnet [--home PATH] trust-admin [--accept-new-key]
+Print and pin this service's admin key; --accept-new-key replaces a rotated key.`,
+  hello: `agentnet [--home PATH] hello RECIPIENT
+Send a fixed capability card as kind result to a current peer.`,
+  peers: `agentnet [--home PATH] peers
+List allowed outgoing recipients and whether each may reply.`,
+  send: `agentnet [--home PATH] send RECIPIENT --file PATH | --stdin [--kind message|prompt|instruction|result]
+Send UTF-8 text to a current peer; message text never appears in arguments.`,
+  inbox: `agentnet [--home PATH] inbox [--wait]
+Print up to 20 pending messages without acknowledging them; --wait holds up to 25s.`,
+  receive: `agentnet [--home PATH] receive [--wait] [--spool DIR] [--ack]
+Print messages as JSON lines; --wait holds and repeats, --spool deduplicates, --ack after durable delivery.`,
+  ack: `agentnet [--home PATH] ack MESSAGE_ID
+Acknowledge receipt and remove the message from your inbox.`,
+  doctor: `agentnet [--home PATH] doctor
+One diagnostic JSON: client, updateChannel, local, mesh, and warnings.`,
+  version: `agentnet version
+Show the installed client build version.`,
+  update: `agentnet update
+Replace this client with the latest verified release.`,
+  remove: `agentnet [--home PATH] remove
+Archive this home after interactive fingerprint confirmation.`,
+  'admin identity': `agentnet [--home PATH] admin identity
+Print public JSON for ADMIN_IDENTITY provisioning.`,
+  'admin invite': `agentnet [--home PATH] admin invite --out PATH | --out - [--name NAME] [--auto-approve --confirm] [--for FINGERPRINT]
+Create a one-use invitation; --out - prints the token to stdout and writes no file.`,
+  'admin pending': `agentnet [--home PATH] admin pending [--wait]
+List pending identities and complete fingerprints; --wait holds up to 25s.`,
+  'admin agents': `agentnet [--home PATH] admin agents
+List every enrolled identity with status and name.`,
+  'admin status': `agentnet [--home PATH] admin status
+Every agent with unread counts and last seen time.`,
+  'admin audit': `agentnet [--home PATH] admin audit
+List recent admin events.`,
+  'admin approve': `agentnet [--home PATH] admin approve ID --name NAME [--grant-with A,B,...]
+Approve a pending identity and grant both directions with each partner.`,
+  'admin rename': `agentnet [--home PATH] admin rename ID --name NAME
+Rename an active agent.`,
+  'admin revoke': `agentnet [--home PATH] admin revoke ID
+Revoke an identity permanently.`,
+  'admin grant': `agentnet [--home PATH] admin grant FROM TO
+Allow one direction between active identities.`,
+  'admin deny': `agentnet [--home PATH] admin deny FROM TO
+Remove that grant and block pending messages.`,
+  'admin mesh': `agentnet [--home PATH] admin mesh ID ID [ID...]
+Grant both directions between 2 and 16 identities or names.`,
+  'admin messages': `agentnet [--home PATH] admin messages [--agent ID]
+Read up to 100 recent messages, including acked ones.`,
+  'admin peers': `agentnet [--home PATH] admin peers ID
+List the peers an identity may send to: name, identity, and whether that peer may reply.`,
+  'admin fingerprint': `agentnet [--home PATH] admin fingerprint ID
+Resolve a fingerprint or unique prefix and print it bare and grouped (four hex, space separated) for comparison.`,
+  admin: `Admin commands need an admin home and take a full fingerprint or a unique prefix:
+  admin identity | admin invite | admin pending | admin approve | admin rename
+  admin revoke | admin grant | admin deny | admin mesh | admin messages
+  admin audit | admin agents | admin status | admin peers | admin fingerprint
+Run 'agentnet help admin COMMAND' for one command's usage.`,
 };
 
 // Preserve JSON while escaping control characters that could mislead a terminal reader.
@@ -435,12 +530,31 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<void
       file: { type: 'string' }, stdin: { type: 'boolean' }, kind: { type: 'string' },
       wait: { type: 'boolean' }, watch: { type: 'boolean' }, spool: { type: 'string' }, ack: { type: 'boolean' },
       'accept-new-key': { type: 'boolean' },
-      out: { type: 'string' }, name: { type: 'string' }, 'auto-approve': { type: 'boolean' }, for: { type: 'string' },
+      out: { type: 'string' }, name: { type: 'string' }, 'auto-approve': { type: 'boolean' }, confirm: { type: 'boolean' }, for: { type: 'string' },
       'grant-with': { type: 'string' }, agent: { type: 'string' }, help: { type: 'boolean', short: 'h' },
     } });
   } catch { throw new ClientError('Invalid command arguments. Run --help for supported commands and options.'); }
   const { values, positionals, tokens } = parsed;
-  if (values.help || positionals.length === 0 || positionals[0] === 'help') {
+  if (values.help && positionals.length === 0) {
+    process.stdout.write(HELP);
+    return;
+  }
+  if (positionals.length > 0 && positionals[0] === 'help') {
+    if (positionals.length < 2) { process.stdout.write(HELP); return; }
+    const named = positionals[1] === 'admin' ? (positionals[2] === undefined ? 'admin' : `admin ${positionals[2]}`) : positionals[1]!;
+    const usage = USAGE[named];
+    requireCondition(usage !== undefined, `Unknown command: ${named}. Run --help for supported commands.`);
+    process.stdout.write(usage + '\n');
+    return;
+  }
+  if (values.help && positionals.length > 0) {
+    const named = positionals[0] === 'admin' ? (positionals[1] === undefined ? 'admin' : `admin ${positionals[1]}`) : positionals[0]!;
+    const usage = USAGE[named];
+    requireCondition(usage !== undefined, `Unknown command: ${named}. Run --help for supported commands.`);
+    process.stdout.write(usage + '\n');
+    return;
+  }
+  if (positionals.length === 0) {
     process.stdout.write(HELP);
     return;
   }
@@ -457,9 +571,14 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<void
     requireCondition(token.name === 'home' || specification.options.includes(token.name), 'An option is not allowed for this command. Run --help.');
   }
   requireCondition(values.home === undefined || values.home.length > 0, '--home cannot be empty.');
-  const home = resolve(values.home ?? DEFAULT_HOME);
+  const envHome = process.env.AGENTNET_HOME;
+  requireCondition(envHome === undefined || envHome.length > 0, 'AGENTNET_HOME cannot be empty.');
+  // An environment-selected home counts as explicit for the admin-init rule, so resolve
+  // it after the flags and before any other use of the home path.
+  const explicitHome = values.home ?? envHome;
+  const home = resolve(explicitHome ?? DEFAULT_HOME);
   if (command === 'init') {
-    if (values.admin) requireCondition(values.home !== undefined && home !== resolve(DEFAULT_HOME), 'Admin initialization requires an explicit --home different from the default agent home.');
+    if (values.admin) requireCondition(explicitHome !== undefined && home !== resolve(DEFAULT_HOME), 'Admin initialization requires an explicit --home different from the default agent home.');
     const client = await AgentClient.init(home, values.server ?? DEFAULT_SERVER, values.admin ?? false, values.label);
     printJSON({ id: client.publicIdentity().id, role: client.config.role, server: client.config.server, label: client.config.label, home });
     return;
@@ -529,12 +648,27 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<void
       await untilInterrupted(signal => client.receive(emitJSON, { wait: values.wait ?? false, spool: values.spool, ack: values.ack ?? false }, signal));
       return;
     case 'remove': printJSON(await client.archive()); return;
-    case 'admin invite': printJSON(await client.adminInvite(requiredOption(values.out, '--out'), { name: values.name, autoApprove: values['auto-approve'] ?? false, for: values.for })); return;
+    case 'admin invite': {
+      // An auto-approving token needs no fingerprint match and no second step, so the
+      // token alone admits the agent; that is exactly why it must not be created silently.
+      requireCondition(!(values['auto-approve'] === true && values.confirm !== true),
+        '--auto-approve makes the token alone admit the agent: enrollment is accepted with no fingerprint check, so anyone holding the token enrolls and is immediately active with the reserved name. Pass --confirm to create such an invitation.');
+      const receipt = await client.adminInvite(requiredOption(values.out, '--out'), { name: values.name, autoApprove: values['auto-approve'] ?? false, for: values.for });
+      const { token, ...rest } = receipt;
+      if (receipt.stdout) {
+        requireCondition(typeof token === 'string', 'The invitation token is missing.');
+        process.stdout.write(token + '\n');
+      }
+      printJSON(rest);
+      return;
+    }
     case 'admin pending': printJSON(await client.adminList('pending', { wait: values.wait ?? false })); return;
     case 'admin agents': printJSON(await client.adminList('agents')); return;
     case 'admin status': printJSON(await client.adminStatus(), 2); return;
     case 'admin audit': printJSON(await client.adminList('audit')); return;
     case 'admin messages': printJSON(await client.adminMessages(values.agent)); return;
+    case 'admin peers': printJSON(await client.adminPeers(positional[0]!)); return;
+    case 'admin fingerprint': printJSON(await client.adminFingerprint(positional[0]!)); return;
     case 'admin approve': {
       const partners = values['grant-with'] === undefined ? [] : values['grant-with'].split(',').map(value => value.trim()).filter(value => value.length > 0);
       requireCondition(values['grant-with'] === undefined || partners.length > 0, '--grant-with needs at least one name or identity.');
@@ -560,7 +694,7 @@ function reportError(error: unknown): void {
   };
   const code = error instanceof Error && 'code' in error ? String(error.code) : '';
   const message = error instanceof ClientError ? error.message :
-    (Object.hasOwn(fileErrors, code) ? fileErrors[code]! : 'Operation failed. Check local configuration, file contents, and server data.');
+    (describeFileError(error) ?? (Object.hasOwn(fileErrors, code) ? fileErrors[code]! : 'Operation failed. Check local configuration, file contents, and server data.'));
   process.stderr.write(JSON.stringify({ error: message.slice(0, 300) }) + '\n');
   process.exitCode = 1;
 }

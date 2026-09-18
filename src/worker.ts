@@ -25,7 +25,7 @@ const API_PATHS: Record<string, true> = {
   '/v1/enroll': true, '/v1/status': true, '/v1/peers': true,
   '/v1/send': true, '/v1/inbox': true, '/v1/ack': true,
   '/v1/admin/invite': true, '/v1/admin/pending': true, '/v1/admin/approve': true, '/v1/admin/rename': true,
-  '/v1/admin/revoke': true, '/v1/admin/grant': true, '/v1/admin/agents': true,
+  '/v1/admin/revoke': true, '/v1/admin/grant': true, '/v1/admin/agents': true, '/v1/admin/peers': true,
   '/v1/admin/audit': true, '/v1/admin/messages': true, '/v1/admin/mesh': true, '/v1/admin/status': true,
 };
 const ASSET_PATHS: Record<string, true> = {
@@ -756,6 +756,21 @@ export class Network extends DurableObject<Env> {
         const agents = this.sql.exec<AgentRow>('SELECT * FROM agents ORDER BY created_at, id').toArray();
         return json({ agents: agents.map(agent => ({ identity: JSON.parse(agent.identity) as PublicIdentity, name: agent.name, status: agent.status, createdAt: agent.created_at })) });
       }
+      case '/v1/admin/peers': {
+        fields(body, ['id']);
+        const id = this.resolveId(body.id);
+        this.active(id);
+        // Same query shape as /v1/peers, parameterized by the administrator-supplied identity.
+        const peers = this.sql.exec<{ name: string; identity: string; inbound: number }>(`
+          SELECT a.name, a.identity, (r.to_id IS NOT NULL) AS inbound FROM grants g
+          JOIN agents a ON a.id = g.to_id
+          LEFT JOIN grants r ON r.from_id = g.to_id AND r.to_id = g.from_id
+          WHERE g.from_id = ? AND a.status = 'active' ORDER BY a.name
+        `, id).toArray().map(peer => ({
+          name: peer.name, identity: JSON.parse(peer.identity) as PublicIdentity, inbound: peer.inbound === 1,
+        }));
+        return json({ peers });
+      }
       case '/v1/admin/audit': {
         fields(body, []);
         const events = this.sql.exec<{ time: number; action: string; subject: string }>('SELECT time, action, subject FROM audit ORDER BY sequence DESC LIMIT 1000').toArray();
@@ -839,16 +854,17 @@ export class Network extends DurableObject<Env> {
           for (let j = i + 1; j < list.length; j += 1) {
             this.link(list[i], list[j]);
             edges += 2;
+            this.audit('grant', `${list[i]}:${list[j]}`, now);
+            this.audit('grant', `${list[j]}:${list[i]}`, now);
           }
         }
-        this.audit('mesh', `${list.length} agents`, now);
         return json({ edges });
       }
       case '/v1/admin/status': {
         fields(body, []);
-        const agents = this.sql.exec<{ id: string; name: string | null; status: string; last_seen: number | null; pending: number }>(`
+        const agents = this.sql.exec<{ id: string; name: string | null; status: string; last_seen: number | null; unread: number }>(`
           SELECT a.id, a.name, a.status, a.last_seen,
-            (SELECT COUNT(*) FROM messages m WHERE m.recipient = a.id AND m.status = 'pending' AND m.expires_at > ?) AS pending
+            (SELECT COUNT(*) FROM messages m WHERE m.recipient = a.id AND m.status = 'pending' AND m.expires_at > ?) AS unread
           FROM agents a ORDER BY a.name, a.id LIMIT 1000
         `, now).toArray();
         const totals = this.sql.exec<{ active: number; pending: number; revoked: number; messages: number; pendingMessages: number }>(`
@@ -860,7 +876,7 @@ export class Network extends DurableObject<Env> {
             (SELECT COUNT(*) FROM messages WHERE status = 'pending' AND expires_at > ?) AS pendingMessages
         `, now).one();
         return json({
-          agents: agents.map(agent => ({ id: agent.id, name: agent.name, status: agent.status, pending: agent.pending, lastSeen: agent.last_seen })),
+          agents: agents.map(agent => ({ id: agent.id, name: agent.name, status: agent.status, unread: agent.unread, lastSeen: agent.last_seen })),
           totals,
         });
       }

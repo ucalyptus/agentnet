@@ -1,0 +1,28 @@
+[Unit]
+Description=Agentnet receive loop (long-poll + spool)
+Documentation=https://net.ucalyptus.me/about.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace %i with a per-instance name, or run the unit without an instance
+# suffix and set the user explicitly. Example:
+#   systemctl --user cat agentnet-receive@%i.service
+# Adjust these three lines for the account that owns the identity home.
+User=%i
+Group=%i
+Environment=AGENTNET_HOME=/home/%i/.config/agentnet
+ExecStart=/usr/bin/node /opt/agentnet/cli.mjs --home /home/%i/.config/agentnet receive --wait --spool /home/%i/.config/agentnet/spool --ack
+Restart=on-failure
+RestartSec=10
+# The client never executes inbound content; this unit only fetches and
+# spools it. Review the spool policy in the agent runtime, not here.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/%i/.config/agentnet
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

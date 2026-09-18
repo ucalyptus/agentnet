@@ -40,17 +40,34 @@ export function requireCondition(condition: unknown, message: string): asserts c
 function isCode(error: unknown, code: string): boolean {
   return error instanceof Error && 'code' in error && error.code === code;
 }
+const FILE_ERROR_TEXT: Record<string, string> = {
+  ENOENT: 'A required local file or directory is missing.',
+  EEXIST: 'A destination already exists. Nothing was overwritten.',
+  ELOOP: 'Symbolic links are not allowed for local files or directories.',
+  EACCES: 'Filesystem permission denied. Check ownership and private file modes.',
+  EPERM: 'The filesystem refused this operation. Check ownership and permissions.',
+  ENOTDIR: 'A required directory is not a directory.',
+};
+// Local filesystem failures carry the offending path; report it so the user can fix it.
+// Paths are not secret; file contents are, and they are never included.
+export function describeFileError(error: unknown): string | null {
+  if (!(error instanceof Error) || !('path' in error) || typeof error.path !== 'string' || error.path === '') return null;
+  const code = 'code' in error ? error.code : undefined;
+  if (typeof code !== 'string') return null;
+  const text = FILE_ERROR_TEXT[code];
+  return text === undefined ? null : `${text} Path: ${error.path}`;
+}
 function uid(): number {
   requireCondition(typeof process.getuid === 'function', 'A POSIX filesystem with owner permissions is required.');
   return process.getuid();
 }
-function checkDirectory(stat: Stats, privateDirectory: boolean): void {
-  requireCondition(stat.isDirectory() && !stat.isSymbolicLink(), 'A directory is missing or is a symbolic link.');
+function checkDirectory(stat: Stats, privateDirectory: boolean, path: string): void {
+  requireCondition(stat.isDirectory() && !stat.isSymbolicLink(), `A directory is missing or is a symbolic link. Path: ${path}`);
   if (privateDirectory) {
-    requireCondition(stat.uid === uid() && (stat.mode & 0o7777) === 0o700, 'Agent directories must be owned by you and have mode 0700.');
+    requireCondition(stat.uid === uid() && (stat.mode & 0o7777) === 0o700, `Agent directories must be owned by you and have mode 0700. Path: ${path}`);
   } else {
     const stickyRoot = stat.uid === 0 && (stat.mode & 0o1000) !== 0;
-    requireCondition((stat.uid === uid() || stat.uid === 0) && ((stat.mode & 0o022) === 0 || stickyRoot), 'A parent directory has unsafe ownership or write permissions.');
+    requireCondition((stat.uid === uid() || stat.uid === 0) && ((stat.mode & 0o022) === 0 || stickyRoot), `A parent directory has unsafe ownership or write permissions. Path: ${path}`);
   }
 }
 async function inspect(path: string): Promise<Stats | undefined> {
@@ -59,7 +76,7 @@ async function inspect(path: string): Promise<Stats | undefined> {
 async function checkParents(path: string, create = false): Promise<void> {
   const parent = dirname(resolve(path));
   const root = parse(parent).root;
-  checkDirectory(await lstat(root), false);
+  checkDirectory(await lstat(root), false, root);
   let current = root;
   for (const part of parent.slice(root.length).split('/').filter(Boolean)) {
     current = join(current, part);
@@ -68,8 +85,8 @@ async function checkParents(path: string, create = false): Promise<void> {
       try { await mkdir(current, { mode: 0o700 }); } catch (error) { if (!isCode(error, 'EEXIST')) throw error; }
       stat = await lstat(current);
     }
-    requireCondition(stat, 'A parent directory does not exist.');
-    checkDirectory(stat, false);
+    requireCondition(stat, `A parent directory does not exist. Path: ${current}`);
+    checkDirectory(stat, false, current);
   }
 }
 async function privateDirectory(path: string, create = false): Promise<void> {
@@ -77,7 +94,7 @@ async function privateDirectory(path: string, create = false): Promise<void> {
   if (create) {
     try { await mkdir(path, { mode: 0o700 }); } catch (error) { if (!isCode(error, 'EEXIST')) throw error; }
   }
-  checkDirectory(await lstat(path), true);
+  checkDirectory(await lstat(path), true, path);
 }
 export async function readFileSafely(path: string, maximum: number, secret = true): Promise<string> {
   await checkParents(path);
@@ -180,8 +197,23 @@ export function identityID(value: unknown): string {
   return value;
 }
 export function identityReference(value: unknown): string {
-  requireCondition(typeof value === 'string' && REFERENCE_PATTERN.test(value), 'Use a complete 64-character identity fingerprint or a unique prefix of at least 16 hexadecimal characters.');
-  return value as string;
+  const ungrouped = ungroupIdentity(value);
+  requireCondition(REFERENCE_PATTERN.test(ungrouped), 'Use a complete 64-character identity fingerprint or a unique prefix of at least 16 hexadecimal characters.');
+  return ungrouped;
+}
+// Identity arguments may be pasted from a chat screenshot in grouped form (spaces,
+// tabs, colons, or dashes between groups); strip that grouping before validation.
+// Only a valid hexadecimal reference qualifies as grouped: an agent name may contain
+// dashes, so a dash-stripped string that is not all hex is left untouched.
+function ungroupIdentity(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  const stripped = value.replace(/[\s:-]/g, '');
+  return REFERENCE_PATTERN.test(stripped) ? stripped : value;
+}
+// A screenshot may show a fingerprint grouped in fours; produce the same form for a
+// human to compare side by side.
+export function groupedFingerprint(id: string): string {
+  return id.replace(/[0-9a-f]{4}(?=[0-9a-f])/g, '$& ');
 }
 function resolvedID(value: unknown, reference: string): string {
   const id = identityID(value);
@@ -234,15 +266,18 @@ export interface EnrollmentStatus {
   adminKey: PublicIdentity | null; adminKeyPinned: 'trusted' | 'first-use' | 'replaced' | 'absent';
 }
 export interface NetworkStatus {
-  agents: { id: string; name: string | null; status: string; pending: number; lastSeen: number | null }[];
+  agents: { id: string; name: string | null; status: string; unread: number; lastSeen: number | null }[];
   totals: { active: number; pending: number; revoked: number; messages: number; pendingMessages: number };
 }
+// The pinned admin key is reported as a state word, never a raw fingerprint or null:
+// what the key is matters more to an operator than its bytes, which status prints.
+export type AdminKeyState = 'not-pinned' | 'first-use' | 'trusted' | 'replaced';
 // Local health, update channel health, and mesh health are separate sections on purpose:
 // an unreachable release host is not a broken mesh, and agents kept confusing the two.
 export interface DoctorReport {
   local: {
     home: string; homeMode: string; homeOk: boolean; identityMode: string; identityOk: boolean;
-    nodeVersion: string; nodeOk: boolean; label: string | null; adminKeyPinned: string | null;
+    nodeVersion: string; nodeOk: boolean; label: string | null; adminKeyPinned: AdminKeyState;
   };
   config: { server: string; role: 'agent' | 'admin' };
   mesh: {
@@ -251,6 +286,14 @@ export interface DoctorReport {
     server: { reachable: boolean; roundTripMs: number; serverTime: number | null; clockSkewMs: number | null; error: string | null };
   };
   warnings: string[];
+}
+// The receipt echoes what was reserved (name) and what admits the agent (binding: the
+// fingerprint, or 'any identity with the token'). stdout reports --out - mode, where
+// the token is returned for printing and no file is created.
+export interface InviteReceipt {
+  path: string; stdout: boolean; token?: string;
+  expiresAt: number; autoApprove: boolean;
+  name: string | null; binding: string;
 }
 
 export class AgentClient {
@@ -346,6 +389,8 @@ export class AgentClient {
     } catch (error) {
       if (error instanceof ClientError) throw error;
       if (options.signal?.aborted) throw new ClientError('Cancelled.');
+      const local = describeFileError(error);
+      if (local !== null) throw new ClientError(local);
       throw new ClientError('Request failed, timed out, redirected, or returned invalid data.');
     }
   }
@@ -555,6 +600,10 @@ export class AgentClient {
     const nodeOk = Number(nodeVersion.split('.')[0]) >= 22;
     if (!nodeOk) warnings.push(`Node.js ${nodeVersion} is older than the required Node.js 22, so this client cannot run reliably.`);
     let enrollment: { status: string | null; name: string | null } = { status: null, name: null };
+    // The pinned admin key is reported as a state word, never null: a diagnostic must
+    // always say what the key situation is. 'replaced' can only come from trust-admin,
+    // so it never appears here, but the value space stays the same for every home.
+    let pinnedState: AdminKeyState = this.config.adminKey === null ? 'not-pinned' : 'trusted';
     let serverTime: number | null = null;
     let reachable = false;
     let serverError: string | null = null;
@@ -567,10 +616,13 @@ export class AgentClient {
         // A mismatched admin key is reported, never thrown: a diagnostic must still print.
         try {
           const pinned = await this.pinAdminKey(result.adminKey, false);
+          if (pinned !== 'absent' && pinned !== 'trusted') pinnedState = pinned;
           if (pinned === 'first-use') warnings.push(`Pinned this service's admin key on first use. Verify that fingerprint with the owner before trusting a signed client update.`);
         } catch (error) { warnings.push(error instanceof ClientError ? error.message : 'Admin key check failed.'); }
       } else {
         await this.request('/v1/admin/status');
+        // An admin home has no enrollment; name the role so status never prints null.
+        enrollment = { status: 'admin', name: null };
       }
       reachable = true;
     } catch (error) { serverError = error instanceof ClientError ? error.message : 'Server request failed.'; }
@@ -605,7 +657,7 @@ export class AgentClient {
     return {
       local: {
         home: this.home, homeMode, homeOk, identityMode, identityOk, nodeVersion, nodeOk,
-        label: this.config.label, adminKeyPinned: this.config.adminKey === null ? null : this.config.adminKey.id,
+        label: this.config.label, adminKeyPinned: pinnedState,
       },
       config: { server: this.config.server, role: this.config.role },
       mesh: {
@@ -633,7 +685,10 @@ export class AgentClient {
     await syncDirectory(dirname(this.home));
     return { archive, networkRevoked: false };
   }
-  async adminInvite(outValue: string, options: { name?: string; autoApprove?: boolean; for?: string } = {}): Promise<{ path: string; expiresAt: number; autoApprove: boolean; name: string | null; for: string | null }> {
+  // An invitation receipt names what was reserved and what admits the agent, so an admin
+  // knows whether a leaked token is usable by anyone else. --out - prints the token to
+  // standard output and writes no file; the token is only carried in the receipt then.
+  async adminInvite(outValue: string, options: { name?: string; autoApprove?: boolean; for?: string } = {}): Promise<InviteReceipt> {
     this.requireRole('admin');
     const reserved = options.name === undefined ? null : name(options.name);
     const autoApprove = options.autoApprove === true;
@@ -641,9 +696,12 @@ export class AgentClient {
     // to anyone else because only that fingerprint can consume it.
     const bound = options.for === undefined ? null : identityID(options.for);
     requireCondition(!autoApprove || reserved !== null, 'An auto-approving invitation must reserve a name with --name.');
-    const path = resolve(outValue);
-    await checkParents(path);
-    requireCondition(!(await inspect(path)), 'Invitation output already exists. It was not overwritten.');
+    const toStdout = outValue === '-';
+    const path = toStdout ? outValue : resolve(outValue);
+    if (!toStdout) {
+      await checkParents(path);
+      requireCondition(!(await inspect(path)), 'Invitation output already exists. It was not overwritten.');
+    }
     const body: Record<string, unknown> = {};
     if (reserved !== null) body.name = reserved;
     if (autoApprove) body.autoApprove = true;
@@ -655,8 +713,9 @@ export class AgentClient {
     const automatic = result.autoApprove === true;
     const echoed = result.for === null || result.for === undefined ? null : identityID(result.for);
     requireCondition(named === reserved && automatic === autoApprove && echoed === bound, 'Server created a different invitation than the one requested.');
+    if (toStdout) return { path, stdout: true, token: result.invite, expiresAt, autoApprove: automatic, name: named, binding: echoed === null ? 'any identity with the token' : echoed };
     await writeExclusive(path, result.invite + '\n');
-    return { path, expiresAt, autoApprove: automatic, name: named, for: echoed };
+    return { path, stdout: false, expiresAt, autoApprove: automatic, name: named, binding: echoed === null ? 'any identity with the token' : echoed };
   }
   async adminList(command: 'pending' | 'agents' | 'audit', options: { wait?: boolean } = {}): Promise<unknown> {
     this.requireRole('admin');
@@ -687,11 +746,13 @@ export class AgentClient {
     const agents = array(result.agents, LIST_LIMIT).map(value => {
       const item = record(value);
       requireCondition(['pending', 'active', 'revoked'].includes(String(item.status)), 'Invalid agent status.');
+      // 0.3.1 renamed the per-agent unread count from pending; accept either shape and
+      // always expose it as unread so a stale server never breaks the client.
       return {
         id: identityID(item.id),
         name: item.name === null ? null : name(item.name),
         status: item.status as string,
-        pending: counter(item.pending),
+        unread: counter(item.unread === undefined ? item.pending : item.unread),
         lastSeen: item.lastSeen === null ? null : timestamp(item.lastSeen),
       };
     });
@@ -719,7 +780,8 @@ export class AgentClient {
   }
   // Names are convenient locally; only identity fingerprints or prefixes reach the server.
   private async resolveIdentities(values: string[]): Promise<string[]> {
-    const named = values.filter(value => !REFERENCE_PATTERN.test(value));
+    const ungrouped = values.map(ungroupIdentity);
+    const named = ungrouped.filter(value => !REFERENCE_PATTERN.test(value));
     const byName = new Map<string, string>();
     if (named.length) {
       const listed = await this.adminList('agents') as { agents: { identity: { id: string }; status: string; name: string | null }[] };
@@ -727,7 +789,7 @@ export class AgentClient {
         if (agent.status === 'active' && agent.name !== null) byName.set(agent.name, agent.identity.id);
       }
     }
-    const resolved = values.map(value => {
+    const resolved = ungrouped.map(value => {
       if (REFERENCE_PATTERN.test(value)) return value;
       const id = byName.get(name(value));
       requireCondition(id, `No active agent is named ${value}.`);
@@ -735,6 +797,27 @@ export class AgentClient {
     });
     requireCondition(new Set(resolved).size === resolved.length, 'The same identity was listed more than once.');
     return resolved;
+  }
+  // A reference may be a full fingerprint or a unique prefix; enrolled identities are the
+  // only namespace that can complete it, so resolution reads the same list an admin sees.
+  private async resolveReference(reference: string): Promise<string> {
+    const listed = await this.adminList('agents') as { agents: { identity: { id: string } }[] };
+    const matches = listed.agents.filter(agent => agent.identity.id.startsWith(reference));
+    requireCondition(matches.length === 1, matches.length === 0
+      ? 'No enrolled identity matches that reference.'
+      : 'That reference is ambiguous; give more characters.');
+    return matches[0]!.identity.id;
+  }
+  async adminPeers(idValue: string): Promise<{ peers: PeerView[] }> {
+    this.requireRole('admin');
+    const id = await this.resolveReference(identityReference(idValue));
+    const result = await this.request('/v1/admin/peers', { id });
+    return { peers: await Promise.all(array(result.peers, LIST_LIMIT).map(peer)) };
+  }
+  async adminFingerprint(idValue: string): Promise<{ id: string; grouped: string }> {
+    this.requireRole('admin');
+    const id = await this.resolveReference(identityReference(idValue));
+    return { id, grouped: groupedFingerprint(id) };
   }
   async adminApprove(idValue: string, nameValue: string, grantWith: string[] = []): Promise<{ id: string; status: 'active'; name: string; mutualGrants: number }> {
     this.requireRole('admin');
