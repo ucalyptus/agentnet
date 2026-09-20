@@ -10,14 +10,30 @@ export interface Env {
   NETWORK: DurableObjectNamespace<Network>;
   ASSETS: Fetcher;
   ADMIN_IDENTITY?: string;
+  // Daily rows-written ceiling this object holds itself to. The Workers Free plan stops
+  // the object at 100,000; set it to 0 on a paid plan to disable the brake entirely.
+  ROWS_WRITTEN_LIMIT?: string;
 }
 
 const MINUTE = 60_000;
+const DAY = 24 * 60 * MINUTE;
 const PENDING_TTL = 24 * 60 * MINUTE;
 const INVITE_TTL = 60 * MINUTE;
 const AUDIT_TTL = 30 * 24 * 60 * MINUTE;
 const HOLD_WINDOW = 25_000;
 const MAX_WAITERS = 4;
+// Expired rows are filtered by every read, so deleting them is housekeeping, not
+// correctness. Sweeping on each request cost six write statements per request.
+const CLEANUP_INTERVAL = 10 * MINUTE;
+// last_seen is an operator display, not a protocol value: minute-exact is enough.
+const LAST_SEEN_RESOLUTION = 5 * MINUTE;
+const DEFAULT_ROWS_WRITTEN_LIMIT = 100_000;
+// Rows of usage that may be lost to an eviction before the meter is checkpointed.
+const METER_FLUSH = 250;
+// Above this share of the daily ceiling, optional work (sends, long polls) is refused so
+// the remaining budget serves delivery and administration.
+const BRAKE_SHARE = 0.95;
+const STORAGE_LIMIT_PATTERN = /exceed|limit|quota|overload/i;
 // Long poll registry keys are namespaced, so an identity's inbox and status holds are
 // independent. New enrollments share one key: only the administrator waits on them.
 const PENDING_KEY = 'enrollment';
@@ -62,15 +78,20 @@ type Authenticated = {
 };
 
 class HttpError extends Error {
-  constructor(readonly status: number) { super('Request rejected'); }
+  constructor(readonly status: number, readonly code?: string, readonly retryAfter?: number) { super('Request rejected'); }
 }
 
-function requireValue(condition: unknown, status = 400): asserts condition {
-  if (!condition) throw new HttpError(status);
+function requireValue(condition: unknown, status = 400, code?: string): asserts condition {
+  if (!condition) throw new HttpError(status, code);
 }
 
-function json(value: unknown, status = 200): Response {
-  return Response.json(value, { status, headers: RESPONSE_HEADERS });
+function json(value: unknown, status = 200, headers: Record<string, string> = {}): Response {
+  return Response.json(value, { status, headers: { ...RESPONSE_HEADERS, ...headers } });
+}
+
+// Free-tier daily counters reset at 00:00 UTC, so that is the only honest retry time.
+function untilReset(now: number): number {
+  return Math.ceil((Math.floor(now / DAY) * DAY + DAY - now) / 1000);
 }
 
 function messagePage<T>(rows: Iterable<T>, project: (row: T) => unknown, maxBytes: number): Response {
@@ -88,14 +109,31 @@ function messagePage<T>(rows: Iterable<T>, project: (row: T) => unknown, maxByte
   });
 }
 
+// Every rejection names itself. A bare "HTTP 500" is what made the 19 September outage
+// undiagnosable from the client side, so a platform fault now carries its own cause and
+// is written to the Worker log as well.
 function failure(error: unknown): Response {
-  const status = error instanceof HttpError ? error.status : 500;
   const messages: Record<number, string> = {
     400: 'Invalid request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not found',
     405: 'Method not allowed', 409: 'Conflict', 413: 'Request too large',
     429: 'Request limit exceeded', 500: 'Request failed', 503: 'Service unavailable',
   };
-  return json({ error: messages[status] ?? 'Request failed' }, status);
+  if (error instanceof HttpError) {
+    const body: Record<string, unknown> = { error: messages[error.status] ?? 'Request failed' };
+    if (error.code !== undefined) body.code = error.code;
+    if (error.retryAfter !== undefined) body.retryAfterSeconds = error.retryAfter;
+    const headers: Record<string, string> = error.retryAfter === undefined ? {} : { 'retry-after': String(error.retryAfter) };
+    return json(body, error.status, headers);
+  }
+  const detail = error instanceof Error ? error.message : String(error);
+  console.error('agentnet: unhandled failure', detail);
+  if (STORAGE_LIMIT_PATTERN.test(detail)) {
+    const retryAfter = untilReset(Date.now());
+    return json({
+      error: messages[503], code: 'storage-limit', detail: detail.slice(0, 300), retryAfterSeconds: retryAfter,
+    }, 503, { 'retry-after': String(retryAfter) });
+  }
+  return json({ error: messages[500], code: 'internal' }, 500);
 }
 
 function objectBody(raw: string): Record<string, unknown> {
@@ -198,6 +236,16 @@ export class Network extends DurableObject<Env> {
   private adminIdentity: PublicIdentity | undefined;
   // Long poll waiters, in memory only: eviction or a crash just ends a poll early.
   private readonly waiters = new Map<string, Set<() => void>>();
+  // Rate windows, in memory: a durable row per request spent 26,000 writes a day against
+  // a 100,000-row daily ceiling. An eviction forgives one window and nothing else.
+  private readonly hits = new Map<string, number[]>();
+  // The last last_seen value actually written for an identity, so a polling agent stops
+  // rewriting its own row on every request.
+  private readonly lastSeenWritten = new Map<string, number>();
+  private lastCleanup = 0;
+  // Rows written today as counted here. The platform's own counter is visible only in the
+  // dashboard and in an email after the cap has already stopped the service.
+  private meter = { day: '', rows: 0, checkpoint: 0, requests: 0 };
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -240,15 +288,11 @@ export class Network extends DurableObject<Env> {
           nonce TEXT NOT NULL,
           expires_at INTEGER NOT NULL,
           PRIMARY KEY (identity_id, nonce)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS meters (
+          day TEXT PRIMARY KEY,
+          rows_written INTEGER NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS nonces_expiry ON nonces(expires_at);
-        CREATE TABLE IF NOT EXISTS rate_events (
-          scope TEXT NOT NULL,
-          nonce TEXT NOT NULL,
-          created_at INTEGER NOT NULL,
-          PRIMARY KEY (scope, nonce)
-        );
-        CREATE INDEX IF NOT EXISTS rate_events_time ON rate_events(created_at);
         CREATE TABLE IF NOT EXISTS audit (
           sequence INTEGER PRIMARY KEY AUTOINCREMENT,
           time INTEGER NOT NULL,
@@ -258,8 +302,7 @@ export class Network extends DurableObject<Env> {
         CREATE INDEX IF NOT EXISTS audit_time ON audit(time);
       `);
       this.migrate();
-      this.ctx.storage.transactionSync(() => this.cleanup(Date.now()));
-      await this.ctx.storage.setAlarm(Date.now() + MINUTE);
+      this.loadMeter(Date.now());
     });
   }
 
@@ -275,6 +318,22 @@ export class Network extends DurableObject<Env> {
       const present = this.sql.exec<{ name: string }>(`PRAGMA table_info(${table})`).toArray().some(row => row.name === column);
       if (!present) this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
     }
+    // Rate limiting moved into memory in 0.4.0; the table only costs writes now.
+    this.sql.exec('DROP TABLE IF EXISTS rate_events');
+    // A replay row used to cost three rows written: the table row, its primary key index
+    // and an expiry index. Every authenticated request writes one, so this was most of
+    // the 100,000-row daily budget. WITHOUT ROWID and no secondary index costs one row;
+    // the expiry sweep reads the table instead, and reads have a 5,000,000-row budget.
+    // Nonces live about a minute, so the table is rebuilt rather than copied.
+    const shape = this.sql.exec<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'nonces'").toArray()[0]?.sql ?? '';
+    if (shape.includes('WITHOUT ROWID')) return;
+    this.sql.exec('DROP TABLE IF EXISTS nonces');
+    this.sql.exec(`CREATE TABLE nonces (
+      identity_id TEXT NOT NULL,
+      nonce TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      PRIMARY KEY (identity_id, nonce)
+    ) WITHOUT ROWID`);
   }
 
   // Called after the relevant row commits, never while a transaction or lock is held.
@@ -315,15 +374,17 @@ export class Network extends DurableObject<Env> {
       const token = bearer(request);
       // Do not hold the object-wide authentication lock while reading a client stream.
       const raw = await boundedBody(request);
+      this.meter.requests += 1;
       const result = await this.ctx.blockConcurrencyWhile(async () => {
         try {
-          this.ctx.storage.transactionSync(() => this.cleanup(Date.now()));
+          this.ctx.storage.transactionSync(() => this.cleanupIfDue(Date.now()));
           const auth = await this.authenticate(token, request.url, raw, url.pathname);
           requireValue(request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() === 'application/json');
           const body = objectBody(raw);
           return await this.dispatch(url.pathname, body, auth);
         } catch (error) { return failure(error); }
       });
+      this.flushMeter();
       if (result instanceof Response) return result;
       // The wait happens after the lock is released and outside every transaction, so
       // other agents keep sending, acknowledging and being administered during a hold.
@@ -341,21 +402,83 @@ export class Network extends DurableObject<Env> {
     } catch (error) { return failure(error); }
   }
 
+  // Only a pending alarm from a release that still scheduled one reaches this. It sweeps
+  // once and does not reschedule: a minutely alarm was 1,440 requests and 1,440 rows a day
+  // to delete rows that every read already filters out.
   async alarm(): Promise<void> {
     await this.ctx.blockConcurrencyWhile(async () => {
-      this.ctx.storage.transactionSync(() => this.cleanup(Date.now()));
-      await this.ctx.storage.setAlarm(Date.now() + MINUTE);
+      const now = Date.now();
+      this.ctx.storage.transactionSync(() => {
+        this.lastCleanup = now;
+        this.cleanup(now);
+      });
+      this.flushMeter();
     });
+  }
+
+  // Expired rows are excluded by every read that matters, so sweeping is housekeeping.
+  // Running it per request cost six write statements per request; ten minutes is enough.
+  private cleanupIfDue(now: number): void {
+    if (now - this.lastCleanup < CLEANUP_INTERVAL) return;
+    this.lastCleanup = now;
+    this.cleanup(now);
   }
 
   private cleanup(now: number): void {
     // Revocation is permanent, including pending enrollment that has timed out.
-    this.sql.exec("UPDATE agents SET status = 'revoked', expires_at = NULL WHERE status = 'pending' AND expires_at <= ?", now);
-    this.sql.exec('DELETE FROM invitations WHERE expires_at <= ?', now);
-    this.sql.exec('DELETE FROM messages WHERE expires_at <= ?', now);
-    this.sql.exec('DELETE FROM nonces WHERE expires_at <= ?', now);
-    this.sql.exec('DELETE FROM rate_events WHERE created_at <= ?', now - MINUTE);
-    this.sql.exec('DELETE FROM audit WHERE time <= ?', now - AUDIT_TTL);
+    this.mutate("UPDATE agents SET status = 'revoked', expires_at = NULL WHERE status = 'pending' AND expires_at <= ?", now);
+    this.mutate('DELETE FROM invitations WHERE expires_at <= ?', now);
+    this.mutate('DELETE FROM messages WHERE expires_at <= ?', now);
+    this.mutate('DELETE FROM nonces WHERE expires_at <= ?', now);
+    this.mutate('DELETE FROM audit WHERE time <= ?', now - AUDIT_TTL);
+  }
+
+  // Every write goes through here. Rows written is the cap that stopped this service on
+  // 19 September, and until now nothing inside the network could see the number.
+  private mutate<T extends Record<string, SqlStorageValue>>(query: string, ...bindings: (string | number | null)[]): T[] {
+    const cursor = this.sql.exec<T>(query, ...bindings);
+    const rows = cursor.toArray();
+    const day = new Date().toISOString().slice(0, 10);
+    if (day !== this.meter.day) this.meter = { day, rows: 0, checkpoint: 0, requests: this.meter.requests };
+    // Counted before the surrounding transaction commits, so a rollback overstates usage.
+    // Overstating is the safe direction: the brake trips early, never late.
+    this.meter.rows += cursor.rowsWritten;
+    return rows;
+  }
+
+  private loadMeter(now: number): void {
+    const day = new Date(now).toISOString().slice(0, 10);
+    const stored = this.sql.exec<{ rows_written: number }>('SELECT rows_written FROM meters WHERE day = ?', day).toArray()[0]?.rows_written ?? 0;
+    this.meter = { day, rows: stored, checkpoint: stored, requests: 0 };
+    this.sql.exec('DELETE FROM meters WHERE day <> ?', day);
+  }
+
+  // One checkpoint row per METER_FLUSH rows keeps the gauge across an eviction without
+  // becoming a significant part of what it measures.
+  private flushMeter(): void {
+    if (this.meter.rows - this.meter.checkpoint < METER_FLUSH) return;
+    const { day, rows } = this.meter;
+    this.mutate(
+      'INSERT INTO meters (day, rows_written) VALUES (?, ?) ON CONFLICT(day) DO UPDATE SET rows_written = excluded.rows_written',
+      day, rows,
+    );
+    this.meter.checkpoint = this.meter.rows;
+  }
+
+  private rowsLimit(): number {
+    const configured = Number(this.env.ROWS_WRITTEN_LIMIT);
+    return Number.isFinite(configured) && configured >= 0 && this.env.ROWS_WRITTEN_LIMIT !== undefined
+      ? configured : DEFAULT_ROWS_WRITTEN_LIMIT;
+  }
+
+  // Near the daily ceiling the object stops spending writes on work that can wait. A send
+  // is retryable and a long poll is a convenience; delivery, acknowledgment and
+  // administration are what an operator needs in the last hour before a reset.
+  private brake(path: string, wait: boolean): void {
+    const limit = this.rowsLimit();
+    if (limit === 0 || this.meter.rows < limit * BRAKE_SHARE) return;
+    if (!wait && path !== '/v1/send' && path !== '/v1/enroll' && path !== '/v1/admin/invite') return;
+    throw new HttpError(503, 'storage-brake', untilReset(Date.now()));
   }
 
   private agent(id: string): AgentRow | undefined {
@@ -379,16 +502,22 @@ export class Network extends DurableObject<Env> {
   }
 
   private audit(action: string, subject: string, now = Date.now()): void {
-    this.sql.exec('INSERT INTO audit (time, action, subject) VALUES (?, ?, ?)', now, action, subject);
-    this.sql.exec('DELETE FROM audit WHERE sequence NOT IN (SELECT sequence FROM audit ORDER BY sequence DESC LIMIT 1000)');
+    this.mutate('INSERT INTO audit (time, action, subject) VALUES (?, ?, ?)', now, action, subject);
+    this.mutate('DELETE FROM audit WHERE sequence NOT IN (SELECT sequence FROM audit ORDER BY sequence DESC LIMIT 1000)');
   }
 
-  private rate(scope: string, nonce: string, limit: number): void {
-    this.ctx.storage.transactionSync(() => {
-      const now = Date.now();
-      requireValue(this.count('SELECT COUNT(*) AS count FROM rate_events WHERE scope = ? AND created_at > ?', scope, now - MINUTE) < limit, 429);
-      this.sql.exec('INSERT INTO rate_events (scope, nonce, created_at) VALUES (?, ?, ?)', scope, nonce, now);
-    });
+  // In memory on purpose: see the comment on `hits`. The window is per object instance,
+  // so an eviction resets it; the cost of that is one extra burst, not a durable row.
+  private rate(scope: string, limit: number): void {
+    const now = Date.now();
+    const window = (this.hits.get(scope) ?? []).filter(at => at > now - MINUTE);
+    requireValue(window.length < limit, 429, 'rate');
+    window.push(now);
+    this.hits.set(scope, window);
+    if (this.hits.size <= 1024) return;
+    for (const [key, times] of this.hits) {
+      if (times[times.length - 1] <= now - MINUTE) this.hits.delete(key);
+    }
   }
 
   private async admin(): Promise<PublicIdentity> {
@@ -442,17 +571,23 @@ export class Network extends DurableObject<Env> {
       invitationHash = await sha256(invite);
       requireValue(this.sql.exec('SELECT 1 FROM invitations WHERE hash = ? AND expires_at > ?', invitationHash, Date.now()).toArray().length === 1, 403);
     }
-    this.rate(`request:${identity.id}`, crypto.randomUUID(), isAdmin && identity.id === admin.id ? 600 : 120);
+    this.rate(`request:${identity.id}`, isAdmin && identity.id === admin.id ? 600 : 120);
 
     // This commit is intentionally separate: even an authorized operation that fails
     // validation, permissions, or quotas burns its nonce and cannot be replayed.
     this.ctx.storage.transactionSync(() => {
       const now = Date.now();
-      this.cleanup(now);
+      this.cleanupIfDue(now);
       requireValue(proof.expiresAt > now, 401);
       requireValue(this.sql.exec('SELECT 1 FROM nonces WHERE identity_id = ? AND nonce = ?', identity.id, proof.nonce).toArray().length === 0, 401);
-      this.sql.exec('INSERT INTO nonces (identity_id, nonce, expires_at) VALUES (?, ?, ?)', identity.id, proof.nonce, proof.expiresAt);
-      this.sql.exec('UPDATE agents SET last_seen = ? WHERE id = ?', now, identity.id);
+      this.mutate('INSERT INTO nonces (identity_id, nonce, expires_at) VALUES (?, ?, ?)', identity.id, proof.nonce, proof.expiresAt);
+      // last_seen is an operator display. Rewriting it on every request of a polling
+      // agent spent one row a request for a value nobody reads at that resolution.
+      const written = this.lastSeenWritten.get(identity.id);
+      if (written === undefined || now - written >= LAST_SEEN_RESOLUTION) {
+        this.mutate('UPDATE agents SET last_seen = ? WHERE id = ?', now, identity.id);
+        this.lastSeenWritten.set(identity.id, now);
+      }
     });
 
     if (isAdmin) {
@@ -468,6 +603,7 @@ export class Network extends DurableObject<Env> {
   }
 
   private async dispatch(path: string, body: Record<string, unknown>, auth: Authenticated): Promise<Response | Hold> {
+    this.brake(path, body.wait === true);
     switch (path) {
       case '/v1/enroll': return this.enroll(body, auth);
       case '/v1/send': return this.send(body, auth);
@@ -477,7 +613,7 @@ export class Network extends DurableObject<Env> {
         const woken: string[] = [];
         const result = this.ctx.storage.transactionSync((): Response | Hold => {
           const now = Date.now();
-          this.cleanup(now);
+          this.cleanupIfDue(now);
           if (path.startsWith('/v1/admin/')) {
             requireValue(auth.admin, 403);
             return this.adminOperation(path, body, now, woken);
@@ -525,8 +661,7 @@ export class Network extends DurableObject<Env> {
               requireValue(Array.isArray(body.ids) && body.ids.length <= 100 && body.ids.every(id => typeof id === 'string' && UUID_PATTERN.test(id)));
               let acknowledged = 0;
               for (const id of new Set(body.ids as string[])) {
-                const updated = this.sql.exec("UPDATE messages SET status = 'acknowledged' WHERE id = ? AND recipient = ? AND status = 'pending' RETURNING id", id, auth.identity.id);
-                acknowledged += updated.toArray().length;
+                acknowledged += this.mutate("UPDATE messages SET status = 'acknowledged' WHERE id = ? AND recipient = ? AND status = 'pending' RETURNING id", id, auth.identity.id).length;
               }
               return json({ acknowledged });
             }
@@ -553,7 +688,7 @@ export class Network extends DurableObject<Env> {
   private inbox(id: string): Response {
     return this.ctx.storage.transactionSync(() => {
       const now = Date.now();
-      this.cleanup(now);
+      this.cleanupIfDue(now);
       this.active(id);
       return inboxPage(this.inboxRows(id, now));
     });
@@ -568,7 +703,7 @@ export class Network extends DurableObject<Env> {
   private statusChange(id: string, before: AgentRow['status'], adminKey: PublicIdentity, expired: boolean): Response | null {
     return this.ctx.storage.transactionSync(() => {
       const now = Date.now();
-      this.cleanup(now);
+      this.cleanupIfDue(now);
       const agent = this.agent(id);
       requireValue(agent, 403);
       if (!expired && agent.status === before) return null;
@@ -588,7 +723,7 @@ export class Network extends DurableObject<Env> {
   private pending(): Response {
     return this.ctx.storage.transactionSync(() => {
       const now = Date.now();
-      this.cleanup(now);
+      this.cleanupIfDue(now);
       return this.pendingPage(this.pendingRows(now));
     });
   }
@@ -599,7 +734,7 @@ export class Network extends DurableObject<Env> {
     let requested = false;
     const response = this.ctx.storage.transactionSync(() => {
       const now = Date.now();
-      this.cleanup(now);
+      this.cleanupIfDue(now);
       requireValue(!auth.admin, 403);
       requireValue(!this.agent(auth.identity.id), 409);
       const hash = auth.invitationHash;
@@ -618,8 +753,8 @@ export class Network extends DurableObject<Env> {
         // back before the invitation is consumed so the administrator can reissue a name.
         requireValue(this.sql.exec('SELECT 1 FROM agents WHERE name = ?', reserved).toArray().length === 0, 409);
       }
-      this.sql.exec('DELETE FROM invitations WHERE hash = ?', hash);
-      this.sql.exec(
+      this.mutate('DELETE FROM invitations WHERE hash = ?', hash);
+      this.mutate(
         'INSERT INTO agents (id, identity, name, status, created_at, expires_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?)',
         auth.identity.id, JSON.stringify(auth.identity), reserved, reserved === null ? 'pending' : 'active',
         now, reserved === null ? now + PENDING_TTL : null, now,
@@ -655,12 +790,12 @@ export class Network extends DurableObject<Env> {
     const bound = body.for === undefined ? null : identityId(body.for);
     // An invitation that approves itself must carry the name it will claim.
     requireValue(!autoApprove || name !== null);
-    this.rate(`invite:${auth.identity.id}`, auth.nonce, 10);
+    this.rate(`invite:${auth.identity.id}`, 10);
     const invite = base64url.encode(crypto.getRandomValues(new Uint8Array(32)));
     const hash = await sha256(invite);
     return this.ctx.storage.transactionSync(() => {
       const now = Date.now();
-      this.cleanup(now);
+      this.cleanupIfDue(now);
       const invitations = this.count('SELECT COUNT(*) AS count FROM invitations');
       const pending = this.count("SELECT COUNT(*) AS count FROM agents WHERE status = 'pending'");
       requireValue(invitations + pending < 100, 429);
@@ -671,7 +806,7 @@ export class Network extends DurableObject<Env> {
       }
       const expiresAt = now + INVITE_TTL;
       // Only the invitation digest is stored; the token itself never reaches storage.
-      this.sql.exec('INSERT INTO invitations (hash, expires_at, name, auto_approve, bound_id) VALUES (?, ?, ?, ?, ?)', hash, expiresAt, name, autoApprove ? 1 : 0, bound);
+      this.mutate('INSERT INTO invitations (hash, expires_at, name, auto_approve, bound_id) VALUES (?, ?, ?, ?, ?)', hash, expiresAt, name, autoApprove ? 1 : 0, bound);
       this.audit('invite', auth.identity.id, now);
       return json({ invite, expiresAt, autoApprove, name, for: bound });
     });
@@ -680,11 +815,11 @@ export class Network extends DurableObject<Env> {
   private send(body: Record<string, unknown>, auth: Authenticated): Response {
     fields(body, ['message']);
     this.active(auth.identity.id);
-    this.rate(`send:${auth.identity.id}`, auth.nonce, 60);
+    this.rate(`send:${auth.identity.id}`, 60);
     let stored: string | undefined;
     const response = this.ctx.storage.transactionSync(() => {
       const now = Date.now();
-      this.cleanup(now);
+      this.cleanupIfDue(now);
       let message: Message;
       try {
         const recipient = identityId(record(body.message).to);
@@ -704,7 +839,7 @@ export class Network extends DurableObject<Env> {
       requireValue(this.pendingFor(to) < 100, 429);
       requireValue(this.count('SELECT COUNT(*) AS count FROM messages') < 10_000, 429);
       // Retained acknowledged/blocked rows are also dedup receipts until original expiry.
-      this.sql.exec("INSERT INTO messages (id, sender, recipient, message, status, created_at, expires_at) VALUES (?, ?, ?, ?, 'pending', ?, ?)", id, from, to, encoded, now, expiresAt);
+      this.mutate("INSERT INTO messages (id, sender, recipient, message, status, created_at, expires_at) VALUES (?, ?, ?, ?, 'pending', ?, ?)", id, from, to, encoded, now, expiresAt);
       stored = to;
       return json({ id, duplicate: false, recipientPending: this.pendingFor(to) });
     });
@@ -737,8 +872,8 @@ export class Network extends DurableObject<Env> {
   }
 
   private link(from: string, to: string): void {
-    this.sql.exec('INSERT OR IGNORE INTO grants (from_id, to_id) VALUES (?, ?)', from, to);
-    this.sql.exec('INSERT OR IGNORE INTO grants (from_id, to_id) VALUES (?, ?)', to, from);
+    this.mutate('INSERT OR IGNORE INTO grants (from_id, to_id) VALUES (?, ?)', from, to);
+    this.mutate('INSERT OR IGNORE INTO grants (from_id, to_id) VALUES (?, ?)', to, from);
   }
 
   private adminOperation(path: string, body: Record<string, unknown>, now: number, woken: string[]): Response | Hold {
@@ -794,7 +929,7 @@ export class Network extends DurableObject<Env> {
         // Resolved after the approval itself is known to be valid, so a bad peer list
         // cannot mask a stale or already-approved enrollment.
         const peers = this.peerIds(body.grantWith, id);
-        this.sql.exec("UPDATE agents SET name = ?, status = 'active', expires_at = NULL WHERE id = ?", body.name, id);
+        this.mutate("UPDATE agents SET name = ?, status = 'active', expires_at = NULL WHERE id = ?", body.name, id);
         this.audit('approve', id, now);
         woken.push(`status:${id}`);
         for (const peer of peers) {
@@ -810,7 +945,7 @@ export class Network extends DurableObject<Env> {
         requireValue(typeof body.name === 'string' && NAME_PATTERN.test(body.name));
         requireValue(this.agent(id)?.status === 'active', 409);
         requireValue(this.sql.exec('SELECT 1 FROM agents WHERE name = ?', body.name).toArray().length === 0, 409);
-        this.sql.exec('UPDATE agents SET name = ? WHERE id = ?', body.name, id);
+        this.mutate('UPDATE agents SET name = ? WHERE id = ?', body.name, id);
         this.audit('rename', id, now);
         woken.push(`status:${id}`);
         return json({ id, name: body.name });
@@ -819,9 +954,9 @@ export class Network extends DurableObject<Env> {
         fields(body, ['id']);
         const id = this.resolveId(body.id);
         requireValue(this.agent(id), 404);
-        this.sql.exec("UPDATE agents SET status = 'revoked', expires_at = NULL WHERE id = ?", id);
-        this.sql.exec('DELETE FROM grants WHERE from_id = ? OR to_id = ?', id, id);
-        this.sql.exec("UPDATE messages SET status = 'blocked' WHERE status = 'pending' AND (sender = ? OR recipient = ?)", id, id);
+        this.mutate("UPDATE agents SET status = 'revoked', expires_at = NULL WHERE id = ?", id);
+        this.mutate('DELETE FROM grants WHERE from_id = ? OR to_id = ?', id, id);
+        this.mutate("UPDATE messages SET status = 'blocked' WHERE status = 'pending' AND (sender = ? OR recipient = ?)", id, id);
         this.audit('revoke', id, now);
         woken.push(`status:${id}`);
         return json({ id, status: 'revoked' });
@@ -834,10 +969,10 @@ export class Network extends DurableObject<Env> {
         this.active(from);
         this.active(to);
         if (body.allow) {
-          this.sql.exec('INSERT OR IGNORE INTO grants (from_id, to_id) VALUES (?, ?)', from, to);
+          this.mutate('INSERT OR IGNORE INTO grants (from_id, to_id) VALUES (?, ?)', from, to);
         } else {
-          this.sql.exec('DELETE FROM grants WHERE from_id = ? AND to_id = ?', from, to);
-          this.sql.exec("UPDATE messages SET status = 'blocked' WHERE status = 'pending' AND sender = ? AND recipient = ?", from, to);
+          this.mutate('DELETE FROM grants WHERE from_id = ? AND to_id = ?', from, to);
+          this.mutate("UPDATE messages SET status = 'blocked' WHERE status = 'pending' AND sender = ? AND recipient = ?", from, to);
         }
         this.audit(body.allow ? 'grant' : 'ungrant', `${from}:${to}`, now);
         return json({ from, to, allow: body.allow });
@@ -875,9 +1010,21 @@ export class Network extends DurableObject<Env> {
             (SELECT COUNT(*) FROM messages) AS messages,
             (SELECT COUNT(*) FROM messages WHERE status = 'pending' AND expires_at > ?) AS pendingMessages
         `, now).one();
+        const limit = this.rowsLimit();
         return json({
           agents: agents.map(agent => ({ id: agent.id, name: agent.name, status: agent.status, unread: agent.unread, lastSeen: agent.last_seen })),
           totals,
+          // The free tier's own counters are invisible from inside the network. This is
+          // what this object has spent today, so an operator can act before a cap does.
+          usage: {
+            day: this.meter.day,
+            rowsWritten: this.meter.rows,
+            rowsWrittenLimit: limit,
+            percent: limit === 0 ? 0 : Math.round((this.meter.rows / limit) * 1000) / 10,
+            requests: this.meter.requests,
+            brakeAt: limit === 0 ? 0 : Math.floor(limit * BRAKE_SHARE),
+            resetInSeconds: untilReset(now),
+          },
         });
       }
       default: throw new HttpError(404);

@@ -10,5 +10,10 @@
   "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
   "durable_objects": { "bindings": [{ "name": "NETWORK", "class_name": "Network" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Network"] }],
-  "observability": { "enabled": false }
+  // The daily rows-written ceiling the object holds itself to. 100000 is the Workers
+  // Free plan limit; set "0" on a paid plan to disable the self-imposed brake.
+  "vars": { "ROWS_WRITTEN_LIMIT": "100000" },
+  // An uncaught fault used to be visible only as an exception count on the dashboard.
+  // The Worker logs its own cause now, which is worthless unless this is on.
+  "observability": { "enabled": true, "head_sampling_rate": 1 }
 }

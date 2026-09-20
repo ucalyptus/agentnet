@@ -250,7 +250,7 @@ async function peer(value: unknown): Promise<PeerView> {
 interface Config { version: 1; server: string; role: 'agent' | 'admin'; adminKey: PublicIdentity | null; label: string | null }
 export interface InboxReceipt { messages: (InboxItem & { untrusted: true })[]; transportOnly: true }
 export interface HistoryItem { message: Message; status: 'pending' | 'acknowledged' | 'blocked'; untrusted: true }
-export interface ReceiveOptions { wait: boolean; spool?: string; ack: boolean }
+export interface ReceiveOptions { wait: boolean; intervalSeconds?: number; spool?: string; ack: boolean }
 export interface SendReceipt {
   id: string; duplicate: boolean;
   recipientPending: number | null;
@@ -268,6 +268,12 @@ export interface EnrollmentStatus {
 export interface NetworkStatus {
   agents: { id: string; name: string | null; status: string; unread: number; lastSeen: number | null }[];
   totals: { active: number; pending: number; revoked: number; messages: number; pendingMessages: number };
+  // Absent from a pre-0.4.0 server, which counted nothing.
+  usage: {
+    day: string; rowsWritten: number; rowsWrittenLimit: number; percent: number;
+    requests: number; brakeAt: number; resetInSeconds: number;
+  } | null;
+  quotaWarning: string | null;
 }
 // The pinned admin key is reported as a state word, never a raw fingerprint or null:
 // what the key is matters more to an operator than its bytes, which status prints.
@@ -364,8 +370,25 @@ export class AgentClient {
       const served = Date.parse(response.headers.get('date') ?? '');
       this.serverDate = Number.isSafeInteger(served) ? served : null;
       if (!response.ok) {
-        await response.body?.cancel();
-        throw new ClientError(`Server rejected the request (HTTP ${response.status}).`);
+        // The server names its own failures. Discarding the body here is what turned the
+        // storage-cap outage of 19 September into an unexplained HTTP 500 on every host.
+        const length = response.headers.get('content-length');
+        let cause = '';
+        if (length === null || (/^\d+$/.test(length) && Number(length) <= 8192)) {
+          try {
+            const body = record(JSON.parse((await response.text()).slice(0, 8192)));
+            const said = typeof body.error === 'string' ? body.error : '';
+            const detail = typeof body.detail === 'string' ? ` ${body.detail}` : '';
+            const code = typeof body.code === 'string' ? ` [${body.code}]` : '';
+            const seconds = typeof body.retryAfterSeconds === 'number' && body.retryAfterSeconds > 0 ? body.retryAfterSeconds : 0;
+            const retry = seconds === 0 ? ''
+              : ` Retry after ${seconds < 3600 ? `${Math.ceil(seconds / 60)} minutes` : `${Math.round(seconds / 360) / 10} hours`}.`;
+            if (said) cause = `: ${said}${code}.${detail}${retry}`;
+          } catch { cause = ''; }
+        } else {
+          await response.body?.cancel();
+        }
+        throw new ClientError(`Server rejected the request (HTTP ${response.status})${cause || '.'}`);
       }
       const advertised = response.headers.get('content-length');
       if (advertised !== null && (!/^\d+$/.test(advertised) || Number(advertised) > RESPONSE_LIMIT)) {
@@ -566,11 +589,14 @@ export class AgentClient {
           await this.ack(item.message.id);
         }
       }
-      if (!options.wait || signal.aborted) return;
-      // Unacknowledged messages are returned again immediately; pace those rounds.
-      const idle = fresh.length === 0 ? IDLE_DELAY - (Date.now() - started) : 0;
-      if (idle > 0) {
-        try { await delay(idle, undefined, { signal }); }
+      if (!(options.wait || options.intervalSeconds !== undefined) || signal.aborted) return;
+      // A held request keeps the server object awake for its whole window; an interval
+      // poll wakes it for milliseconds. The idle floor keeps a held loop from spinning.
+      const pause = options.intervalSeconds === undefined
+        ? (fresh.length === 0 ? IDLE_DELAY - (Date.now() - started) : 0)
+        : options.intervalSeconds * 1000 - (Date.now() - started);
+      if (pause > 0) {
+        try { await delay(pause, undefined, { signal }); }
         catch (error) { if (signal.aborted) return; throw error; }
       }
     }
@@ -620,7 +646,8 @@ export class AgentClient {
           if (pinned === 'first-use') warnings.push(`Pinned this service's admin key on first use. Verify that fingerprint with the owner before trusting a signed client update.`);
         } catch (error) { warnings.push(error instanceof ClientError ? error.message : 'Admin key check failed.'); }
       } else {
-        await this.request('/v1/admin/status');
+        const network = await this.adminStatus();
+        if (network.quotaWarning !== null) warnings.push(network.quotaWarning);
         // An admin home has no enrollment; name the role so status never prints null.
         enrollment = { status: 'admin', name: null };
       }
@@ -652,7 +679,7 @@ export class AgentClient {
     if (enrollment.status === 'pending') warnings.push('This identity is still pending. An admin must approve it before sending or receiving.');
     if (enrollment.status === 'revoked') warnings.push('This identity is revoked permanently. Initialize a new home to rejoin.');
     const pollHint = enrollment.status === 'active'
-      ? 'Hold one request instead of polling: receive --wait --spool DIR --ack, or inbox --wait. Both answer within about a second of delivery and never repeat faster than every 5 seconds.'
+      ? 'Run receive --interval 60 --spool DIR --ack from a supervisor. A held request (--wait) delivers in about a second but keeps the server object awake for 25 seconds per call, which is what the free tier charges for; an interval poll costs milliseconds and delivers within the interval.'
       : enrollment.status === 'pending' ? 'Run status --watch to wait for an admin decision instead of polling status.' : null;
     return {
       local: {
@@ -757,12 +784,26 @@ export class AgentClient {
       };
     });
     const totals = record(result.totals);
+    const raw = result.usage === undefined || result.usage === null ? null : record(result.usage);
+    const usage = raw === null ? null : {
+      day: String(raw.day), rowsWritten: counter(raw.rowsWritten), rowsWrittenLimit: counter(raw.rowsWrittenLimit),
+      percent: counter(Math.round(Number(raw.percent) * 10)) / 10, requests: counter(raw.requests),
+      brakeAt: counter(raw.brakeAt), resetInSeconds: counter(raw.resetInSeconds),
+    };
+    // The cap that stopped this service is a daily one, so the warning has to arrive
+    // during the day it is being spent, not in tomorrow's post mortem.
+    const resets = usage === null || usage.resetInSeconds < 3600
+      ? `${Math.ceil((usage?.resetInSeconds ?? 0) / 60)} minutes` : `${Math.round(usage.resetInSeconds / 360) / 10} hours`;
+    const quotaWarning = usage === null || usage.rowsWrittenLimit === 0 || usage.percent < 70 ? null
+      : `The network has written ${usage.rowsWritten} of its ${usage.rowsWrittenLimit} daily rows (${usage.percent}%). Optional work stops at ${usage.brakeAt}. The counter resets in ${resets}.`;
     return {
       agents,
       totals: {
         active: counter(totals.active), pending: counter(totals.pending), revoked: counter(totals.revoked),
         messages: counter(totals.messages), pendingMessages: counter(totals.pendingMessages),
       },
+      usage,
+      quotaWarning,
     };
   }
   async adminMessages(agent?: string): Promise<{ messages: HistoryItem[] }> {

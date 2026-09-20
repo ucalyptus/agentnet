@@ -73,9 +73,13 @@ Agent commands:
                               free-form text, so it adds no injection surface.
   inbox [--wait]              Print up to 20 pending messages without acknowledging them.
                               --wait holds the request until a message arrives, up to 25s.
-  receive [--wait] [--spool DIR] [--ack]
-                              Print messages as JSON lines. --wait holds and repeats until
-                              Ctrl+C or SIGTERM, delivering within about a second.
+  receive [--wait | --interval SECONDS] [--spool DIR] [--ack]
+                              Print messages as JSON lines, repeating until Ctrl+C or
+                              SIGTERM. --interval SECONDS (5-3600) polls on a timer and is
+                              the cheap loop: each call wakes the server for milliseconds
+                              and mail arrives within the interval. --wait instead holds
+                              one request open for up to 25s for near-instant delivery,
+                              and is billed for all 25 seconds of it.
                               --spool writes DIR/<message-id>.json with mode 0600 and never
                               prints a message that is already spooled, across restarts.
                               --ack acknowledges only after the spool file is synced, or
@@ -194,7 +198,7 @@ Examples:
   agentnet hello approved-name
   printf 'hello' | agentnet send approved-name --stdin --kind message
   printf 'build ok' | agentnet send approved-name --stdin --kind result
-  agentnet receive --wait --spool ~/.local/share/agentnet-spool --ack
+  agentnet receive --interval 60 --spool ~/.local/share/agentnet-spool --ack
 `;
 
 const COMMANDS: Record<string, { arity: number | [number, number]; options: readonly string[] }> = {
@@ -208,7 +212,7 @@ const COMMANDS: Record<string, { arity: number | [number, number]; options: read
   peers: { arity: 0, options: [] },
   send: { arity: 1, options: ['file', 'stdin', 'kind'] },
   inbox: { arity: 0, options: ['wait'] },
-  receive: { arity: 0, options: ['wait', 'spool', 'ack'] },
+  receive: { arity: 0, options: ['wait', 'interval', 'spool', 'ack'] },
   ack: { arity: 1, options: [] },
   doctor: { arity: 0, options: [] },
   version: { arity: 0, options: [] },
@@ -255,8 +259,8 @@ List allowed outgoing recipients and whether each may reply.`,
 Send UTF-8 text to a current peer; message text never appears in arguments.`,
   inbox: `agentnet [--home PATH] inbox [--wait]
 Print up to 20 pending messages without acknowledging them; --wait holds up to 25s.`,
-  receive: `agentnet [--home PATH] receive [--wait] [--spool DIR] [--ack]
-Print messages as JSON lines; --wait holds and repeats, --spool deduplicates, --ack after durable delivery.`,
+  receive: `agentnet [--home PATH] receive [--wait | --interval SECONDS] [--spool DIR] [--ack]
+Print messages as JSON lines; --interval polls cheaply on a timer, --wait holds one request for 25s, --spool deduplicates, --ack after durable delivery.`,
   ack: `agentnet [--home PATH] ack MESSAGE_ID
 Acknowledge receipt and remove the message from your inbox.`,
   doctor: `agentnet [--home PATH] doctor
@@ -528,7 +532,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<void
       home: { type: 'string' }, server: { type: 'string' }, admin: { type: 'boolean' }, label: { type: 'string' },
       'invite-file': { type: 'string' }, 'invite-stdin': { type: 'boolean' },
       file: { type: 'string' }, stdin: { type: 'boolean' }, kind: { type: 'string' },
-      wait: { type: 'boolean' }, watch: { type: 'boolean' }, spool: { type: 'string' }, ack: { type: 'boolean' },
+      wait: { type: 'boolean' }, watch: { type: 'boolean' }, spool: { type: 'string' }, ack: { type: 'boolean' }, interval: { type: 'string' },
       'accept-new-key': { type: 'boolean' },
       out: { type: 'string' }, name: { type: 'string' }, 'auto-approve': { type: 'boolean' }, confirm: { type: 'boolean' }, for: { type: 'string' },
       'grant-with': { type: 'string' }, agent: { type: 'string' }, help: { type: 'boolean', short: 'h' },
@@ -644,9 +648,16 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<void
     case 'send': printJSON(await client.send(positional[0]!, textSource(values.file, values.stdin, '--file', '--stdin'), messageKind(values.kind ?? 'message'))); return;
     case 'inbox': printJSON(await client.inbox({ wait: values.wait ?? false })); return;
     case 'ack': printJSON(await client.ack(positional[0]!)); return;
-    case 'receive':
-      await untilInterrupted(signal => client.receive(emitJSON, { wait: values.wait ?? false, spool: values.spool, ack: values.ack ?? false }, signal));
+    case 'receive': {
+      requireCondition(values.interval === undefined || /^[1-9]\d{0,3}$/.test(values.interval), '--interval takes whole seconds.');
+      const intervalSeconds = values.interval === undefined ? undefined : Number(values.interval);
+      requireCondition(intervalSeconds === undefined || (intervalSeconds >= 5 && intervalSeconds <= 3600), '--interval must be between 5 and 3600 seconds.');
+      requireCondition(!(values.wait === true && intervalSeconds !== undefined), 'Use either --wait or --interval, not both.');
+      await untilInterrupted(signal => client.receive(emitJSON, {
+        wait: values.wait ?? false, intervalSeconds, spool: values.spool, ack: values.ack ?? false,
+      }, signal));
       return;
+    }
     case 'remove': printJSON(await client.archive()); return;
     case 'admin invite': {
       // An auto-approving token needs no fingerprint match and no second step, so the

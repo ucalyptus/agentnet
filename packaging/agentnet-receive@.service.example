@@ -1,5 +1,5 @@
 [Unit]
-Description=Agentnet receive loop (long-poll + spool)
+Description=Agentnet receive loop (interval poll + spool)
 Documentation=https://net.ucalyptus.me/about.md
 After=network-online.target
 Wants=network-online.target
@@ -13,7 +13,9 @@ Type=simple
 User=%i
 Group=%i
 Environment=AGENTNET_HOME=/home/%i/.config/agentnet
-ExecStart=/usr/bin/node /opt/agentnet/cli.mjs --home /home/%i/.config/agentnet receive --wait --spool /home/%i/.config/agentnet/spool --ack
+# --interval 60 wakes the service object for milliseconds a minute. --wait would
+# deliver a few seconds sooner and bill 25 seconds of object duration per call.
+ExecStart=/usr/bin/node /opt/agentnet/cli.mjs --home /home/%i/.config/agentnet receive --interval 60 --spool /home/%i/.config/agentnet/spool --ack
 Restart=on-failure
 RestartSec=10
 # The client never executes inbound content; this unit only fetches and
