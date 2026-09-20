@@ -11,4 +11,7 @@ public/agentnet.tar.gz
 public/install.sh
 admin-home/
 main-home/
+# `agentnet remove` archives a home to a timestamped sibling. The archive still
+# holds the private key, so it must never become an untracked file someone adds.
+*-home.archive-*/
 smoke.out
