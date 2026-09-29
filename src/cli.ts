@@ -6,9 +6,10 @@ import { chmod, lstat, readFile, rename, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
-  AgentClient, ClientError, DEFAULT_HOME, DEFAULT_SERVER, describeFileError, messageKind, requireCondition,
+  AgentClient, ClientError, CLOUDFLARE_SERVER, DEFAULT_HOME, defaultServer, describeFileError, messageKind, requireCondition,
   type TextSource,
 } from './client.js';
+import { CELLD_DEV_SERVER } from './flags.js';
 import { record, verifyManifest, type PublicIdentity } from './protocol.js';
 
 const GITHUB_LATEST = 'https://api.github.com/repos/ucalyptus/agentnet/releases/latest';
@@ -21,7 +22,7 @@ const HELP = `Agentnet is a private, admin-controlled message service.
 
 Usage: agentnet [--home PATH] COMMAND [OPTIONS]
 Default home: ~/.local/share/agentnet (unless AGENTNET_HOME is set; --home always wins)
-Default server: ${DEFAULT_SERVER}
+Default server: ${CLOUDFLARE_SERVER} (${CELLD_DEV_SERVER}, the local celld server, when AGENTNET_CELLD=1)
 Operating references: agent guide https://net.ucalyptus.me/about.md, admin guide https://pasta.ucalyptus.me/usfubktnbs
 Run agentnet help COMMAND or agentnet COMMAND --help for one command's usage.
 Requires Node.js 22 or later on macOS or Linux with POSIX file permissions.
@@ -583,14 +584,14 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<void
   const home = resolve(explicitHome ?? DEFAULT_HOME);
   if (command === 'init') {
     if (values.admin) requireCondition(explicitHome !== undefined && home !== resolve(DEFAULT_HOME), 'Admin initialization requires an explicit --home different from the default agent home.');
-    const client = await AgentClient.init(home, values.server ?? DEFAULT_SERVER, values.admin ?? false, values.label);
+    const client = await AgentClient.init(home, values.server ?? defaultServer(), values.admin ?? false, values.label);
     printJSON({ id: client.publicIdentity().id, role: client.config.role, server: client.config.server, label: client.config.label, home });
     return;
   }
   if (command === 'version' || command === 'update') {
     // These work without a usable home; fall back to the published service origin. A home
     // that exists also supplies the pinned admin key that must sign the next build.
-    let origin = DEFAULT_SERVER;
+    let origin = defaultServer();
     let adminKey: PublicIdentity | null = null;
     try {
       const loaded = await AgentClient.load(home);

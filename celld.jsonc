@@ -1,0 +1,14 @@
+// Self-hosted run of the same Worker on celld (https://github.com/denoland/celld).
+// Production stays on Cloudflare via wrangler.jsonc; celld deploy rejects that file's
+// routes, account_id, workers_dev, preview_urls and observability keys.
+// ADMIN_IDENTITY comes from .dev.vars under `celld dev`.
+{
+  "name": "ucalyptus-agentnet",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-09-17",
+  "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
+  "durable_objects": { "bindings": [{ "name": "NETWORK", "class_name": "Network" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Network"] }],
+  // No platform row cap on celld, so the self-imposed Workers Free brake is off.
+  "vars": { "ROWS_WRITTEN_LIMIT": "0" }
+}

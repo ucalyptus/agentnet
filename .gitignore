@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .wrangler/
+.celld/
 .dev.vars
 .env*
 *.key.json

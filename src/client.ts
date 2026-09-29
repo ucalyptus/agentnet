@@ -11,6 +11,7 @@ import {
   createMessage, validateMessage, record,
   type PrivateIdentity, type PublicIdentity, type Peer, type InboxItem, type MessageBody, type Message,
 } from './protocol.js';
+import { CELLD_DEV_SERVER, celldEnabled } from './flags.js';
 
 const NAME_PATTERN = /^[a-z][a-z0-9-]{0,47}$/;
 // Admin commands accept a full fingerprint or a long unique prefix; the server resolves it.
@@ -32,8 +33,14 @@ const IDLE_DELAY = 5_000;
 const CLOCK_WARNING = 10_000;
 const decoder = new TextDecoder('utf-8', { fatal: true });
 export const DEFAULT_HOME = join(homedir(), '.local', 'share', 'agentnet');
-export const DEFAULT_SERVER = 'https://net.ucalyptus.me';
+export const CLOUDFLARE_SERVER = 'https://net.ucalyptus.me';
 export class ClientError extends Error {}
+// Only the default for new homes and home-less update checks: a home's stored server
+// always wins, so an enrolled identity never moves between backends.
+export function defaultServer(): string {
+  try { return celldEnabled() ? CELLD_DEV_SERVER : CLOUDFLARE_SERVER; }
+  catch (error) { throw new ClientError((error as Error).message); }
+}
 export function requireCondition(condition: unknown, message: string): asserts condition {
   if (!condition) throw new ClientError(message);
 }

@@ -13,8 +13,8 @@
   "scripts": {
     "build": "node --experimental-strip-types scripts/build.mjs",
     "typecheck": "tsc --noEmit",
-    "dev": "wrangler dev -c wrangler.dev.jsonc --ip 127.0.0.1",
-    "deploy": "npm run build && wrangler deploy"
+    "dev": "node --env-file-if-exists=.env --experimental-strip-types scripts/runtime.mjs dev",
+    "deploy": "npm run build && node --env-file-if-exists=.env --experimental-strip-types scripts/runtime.mjs deploy"
   },
   "dependencies": {
     "jose": "6.1.3"
